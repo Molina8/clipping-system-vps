@@ -1,0 +1,37 @@
+"""FastAPI application entrypoint."""
+import logging
+
+from fastapi import FastAPI
+
+from app.api.jobs import router as jobs_router
+from app.api.system import router as system_router
+from app.config import settings
+from app.db.database import check_database_connection
+
+
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
+logger = logging.getLogger("clipping-api")
+
+
+app = FastAPI(
+    title="Clipping API",
+    version="0.2.0",
+    description="Backend coordinator for the clipping pipeline (VPS side).",
+)
+
+
+@app.get("/health")
+def health() -> dict:
+    db_ok = check_database_connection()
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "database": "ok" if db_ok else "error",
+    }
+
+
+app.include_router(system_router)
+app.include_router(jobs_router)

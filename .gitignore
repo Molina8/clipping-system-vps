@@ -26,14 +26,14 @@ htmlcov/
 logs/
 *.log
 
-# Storage runtime (los assets reales no van al repo)
+# Storage runtime (assets reales no van al repo)
 storage/previews/
 storage/exports/
 storage/qa/
 storage/thumbnails/
-storage/.gitkeep
+!storage/.gitkeep
 
-# Migraciones compiladas de Alembic
+# Alembic compilado
 alembic/versions/__pycache__/
 
 # IDE / OS

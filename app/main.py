@@ -35,3 +35,5 @@ def health() -> dict:
 
 app.include_router(system_router)
 app.include_router(jobs_router)
+from app.api.workers import router as workers_router  # noqa: E402
+app.include_router(workers_router)

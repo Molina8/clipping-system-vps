@@ -4,7 +4,7 @@
 > Refleja el estado real **punto por punto**: qué está hecho, qué no, qué está a medias, riesgos y próximos pasos.
 > Actualizado en cada cambio relevante por **Clipper** (agente OpenClaw).
 >
-> **Última actualización:** 2026-09-06 16:14 UTC
+> **Última actualización:** 2026-09-06 16:42 UTC
 > **Verificación de estado:** backend operativo y revisado por Clipper ahora mismo.
 > **Fuente de verdad técnica:** el código en `/opt/clipping-system/` y este propio doc.
 > **Fuente de verdad funcional:** el servicio corriendo en `100.109.27.21:8080` (Tailscale).
@@ -14,7 +14,7 @@
 ## TL;DR
 
 - 🟢 **Backend MVP arrancado y respondiendo** — FastAPI en `100.109.27.21:8080`, Postgres nativo en `localhost:5432`, DB `clipping` con tablas `jobs`, `workers`, `campaigns`, `assets`, `candidates`, `clips`.
-- ✅ **Tests pasan** — **124/124 pytest verde** en 3.86s (47 originales + 8 workers + 14 campaigns + 17 assets + 11 candidates + 11 clips + 16 campaign_engine), 2 warnings deprecation menores.
+- ✅ **Tests pasan** — **150/150 pytest verde** en ~5s (47 originales + 8 workers + 14 campaigns + 17 assets + 11 candidates + 11 clips + 16 campaign_engine + 15 clip_selection + 11 candidate_lifecycle), 2 warnings deprecation menores.
 - 🟢 **Servicio systemd robusto** — `clipping-api.service` enabled, Restart=always, MemoryMax=512M, hardening completo (ProtectSystem=strict, ProtectHome, ReadWritePaths). Sobrevive reboots sin problema.
 - 🟢 **Fases A, B, C, D HECHAS** (steps 3, 4, 5-6, 7, 9, 11, 13, 15, 17, 19 del architecture_flow.md)
 - ✅ **Push al día** — commit `5e9aa44` (16:18 UTC) en `jarvismolinabot/clipping-system-vps` main. Estado verificado.
@@ -211,9 +211,11 @@
 ## 📋 Próximos pasos (orden propuesto)
 
 1. ✅ ~~Device Flow `E8A8-95D4`~~ Resuelto (`5e9aa44` en main).
-2. **Bind API** en localhost o `0.0.0.0` con firewall
-3. **Test E2E real VPS↔Worker** (cliente Python que dispara el flujo completo: register → heartbeat → claim → execute → upload)
-4. **CI/CD** (opcional, futuro)
+2. ✅ ~~Step 12-13 — agente LLM Clipper~~ Resuelto (`9218bba` en main, `app/clip_selection/` con agent+validator+MockLLMClient).
+3. ✅ ~~Step 14 — candidate lifecycle (approve→RENDER + reject)~~ Resuelto (`ee7baf1` en main, `app/services/candidate_lifecycle.py`).
+4. **Bind API**: localhost + Tailscale, o `0.0.0.0` con firewall. Decisión Molina.
+5. **Test E2E real VPS↔Worker** (cliente Python que dispara el flujo completo: register → heartbeat → claim → execute → upload).
+6. **CI/CD** (opcional, futuro).
 
 ---
 
@@ -230,3 +232,4 @@
   - ~~Git remote equivocado~~ → ✅ RESUELTO (`5e9aa44` pusheado 16:18 UTC).
   - Bind API solo Tailscale → decisión pendiente de Molina.
   - **Steps OpenClaw PENDIENTES (no son backend, son mi trabajo de Clipper):** 1, 2, 12-14 (con LLM real, no regex), 20, 21.
+- **2026-09-06 16:42 UTC** — **Step 14 ✅ (Candidate lifecycle: approve → RENDER job + reject)**. `app/services/candidate_lifecycle.py` con `approve_candidate()` (valida contra NormalizedSpec re-derivada, marca como `approved`, auto-crea RENDER job con payload completo `candidate_id/asset_id/campaign_id/source_url/local_path/start_time/end_time/format/captions_required/watermark_url/language`; idempotente vía `_find_render_job_for_candidate`; rollback a `pending` si falla la creación del RENDER job) y `reject_candidate()` (rechazo manual con reason). Endpoints nuevos en `app/api/candidates.py`: `POST /candidates/{id}/approve` y `POST /candidates/{id}/reject` (con `RejectPayload` opcional `{reason}`). Side fix: `_EXCLUDE_RE` en `app/campaign_engine/parser.py` ahora acepta `:` y `=` como separador (caso real "Exclude: keyword"). 11 tests nuevos en `tests/test_candidate_lifecycle.py` (approve happy path, out-of-window reject, exclude_keyword reject, double-approve idempotency, manual reject, endpoint tests, auth). **150/150 pytest verde**. Commit `ee7baf1`.

@@ -5,7 +5,8 @@ import logging
 import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.auth import require_bearer
@@ -20,6 +21,13 @@ from app.services.candidate_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class RejectPayload(BaseModel):
+    """Optional body for the reject endpoint."""
+
+    reason: Optional[str] = None
+
 
 router = APIRouter(prefix="/candidates", tags=["candidates"])
 
@@ -78,6 +86,40 @@ def get_one(
     if c is None:
         raise HTTPException(status_code=404, detail="Candidate not found")
     return c
+
+
+@router.post("/{candidate_id}/approve")
+def approve_candidate_endpoint(
+    candidate_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_bearer),
+):
+    """Validate and approve a candidate (Step 14 -> 15).
+
+    Auto-creates a RENDER job if validation passes.
+    Returns a summary dict with status, render_job_id, etc.
+    """
+    from app.services.candidate_lifecycle import approve_candidate
+    try:
+        result = approve_candidate(db, candidate_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return result
+
+
+@router.post("/{candidate_id}/reject", response_model=CandidateOut)
+def reject_candidate_endpoint(
+    candidate_id: uuid.UUID,
+    payload: RejectPayload = Body(default_factory=RejectPayload),
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_bearer),
+):
+    """Manually reject a candidate (Step 14)."""
+    from app.services.candidate_lifecycle import reject_candidate
+    cand = reject_candidate(db, candidate_id, reason=payload.reason)
+    if cand is None:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    return cand
 
 
 @router.patch("/{candidate_id}", response_model=CandidateOut)

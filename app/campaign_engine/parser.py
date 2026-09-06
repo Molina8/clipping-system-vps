@@ -60,7 +60,7 @@ _KEYWORD_RE = re.compile(
 )
 
 _EXCLUDE_RE = re.compile(
-    r"\b(?:exclude|avoid|no|skip|without)\s+"
+    r"\b(?:exclude|avoid|no|skip|without)[:\s=]+"
     r"([^,.\n]+?)(?:[.,\n]|$)",
     re.IGNORECASE,
 )

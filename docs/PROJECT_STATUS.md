@@ -17,7 +17,7 @@
 - ✅ **Tests pasan** — **124/124 pytest verde** en 3.86s (47 originales + 8 workers + 14 campaigns + 17 assets + 11 candidates + 11 clips + 16 campaign_engine), 2 warnings deprecation menores.
 - 🟢 **Servicio systemd robusto** — `clipping-api.service` enabled, Restart=always, MemoryMax=512M, hardening completo (ProtectSystem=strict, ProtectHome, ReadWritePaths). Sobrevive reboots sin problema.
 - 🟢 **Fases A, B, C, D HECHAS** (steps 3, 4, 5-6, 7, 9, 11, 13, 15, 17, 19 del architecture_flow.md)
-- 🟡 **Push bloqueado** — el remote actual apunta a `Molina8/clipping-windows-worker` (error histórico). Device Flow lanzado con código `E8A8-95D4`, esperando autorización de Molina para crear `jarvismolinabot/clipping-system-vps` y pushear.
+- ✅ **Push al día** — commit `5e9aa44` (16:18 UTC) en `jarvismolinabot/clipping-system-vps` main. Estado verificado.
 - ✅ **Tailscale OK** — sigue como root (correcto), mesh con `molina` (PC Windows) y `vps-5764d01a` (este VPS) online.
 
 ---
@@ -187,14 +187,14 @@
 
 | # | Riesgo | Impacto | Mitigación |
 |---|---|---|---|
-| 1 | **Git remote apunta a `Molina8/clipping-windows-worker`** (error histórico) | Commits locales sin backup remoto | Crear `jarvismolinabot/clipping-system-vps` (Device Flow en curso con código `E8A8-95D4`, esperando autorización) o que Molina dé Write access |
+| 1 | ~~**Git remote equivocado**~~ ✅ **RESUELTO 16:18 UTC** | (resuelto) | `5e9aa44` ya en `jarvismolinabot/clipping-system-vps` main. |
 | 2 | **API bind solo a Tailscale** | curl desde localhost falla, herramientas internas no pueden hablarle | Decidir bind: localhost + Tailscale, o `0.0.0.0` con firewall restrictivo |
 
 ## 🟡 Decisiones pendientes
 
 - [ ] **Bind de la API**: ¿añadir localhost, dejar solo Tailscale, o `0.0.0.0` con firewall?
 - [ ] **A/B/C del tool executor** — problema estructural desde 10:52, sigue sin resolver
-- [ ] **Device Flow E8A8-95D4** — Molina debe autorizar para que pueda crear el repo y pushear
+- [x] ~~**Device Flow E8A8-95D4**~~ ✅ Resuelto (`5e9aa44` pusheado 16:18 UTC)
 
 ## 🟢 Logros verificados hoy (2026-09-06)
 
@@ -210,7 +210,7 @@
 
 ## 📋 Próximos pasos (orden propuesto)
 
-1. **Molina autoriza Device Flow `E8A8-95D4`** → yo creo `jarvismolinabot/clipping-system-vps` y pusheo los 10 commits
+1. ✅ ~~Device Flow `E8A8-95D4`~~ Resuelto (`5e9aa44` en main).
 2. **Bind API** en localhost o `0.0.0.0` con firewall
 3. **Test E2E real VPS↔Worker** (cliente Python que dispara el flujo completo: register → heartbeat → claim → execute → upload)
 4. **CI/CD** (opcional, futuro)
@@ -225,8 +225,8 @@
 - **2026-09-06 13:18 UTC** — **Step 4 ✅ (Campaign storage + multi-source)**. Commit `ce5a90a` con 7 archivos: modelo Campaign con source_provider/source_id/source_url/source_metadata, CampaignSpec (reglas agnósticas del proveedor), migración 0003, 4 endpoints (`POST/GET /campaigns`, `GET/PATCH /campaigns/{id}`), service, schemas Pydantic, 14 tests nuevos (69/69 verde). Soporte multi-proveedor integrado desde diseño (twitter/youtube/instagram/tiktok/reddit/twitch/manual/other). E2E verificado: creación multi-source, filtrado por source_provider, transiciones de status, validación Pydantic → 422, sin auth → 401. Commit en local; **push pendiente de repo destino del VPS** (el remote actual apunta al repo del Worker de Molina por error previo).
 - **2026-09-06 13:40 UTC** — **Steps 5-6 ✅ (Asset + Asset Resolver stub)**. Commit `86ece4e` con 7 archivos: modelo Asset con UUID pk, campaign_id FK CASCADE, source_url/source_id/source_provider/asset_type, status enum (pending/downloaded/transcribed/failed), local_path/file_size/duration_seconds/sha256/mime_type, extra_metadata JSONB, downloaded_at/transcribed_at timestamps. Migración 0004 con índices en campaign_id, status, source_provider, (campaign_id, status), FK + CHECK constraints. Endpoints: `POST /assets`, `POST /assets/bulk`, `POST /assets/resolve/{campaign_id}`, `GET /assets` (filters), `GET /assets/{uuid}`, `PATCH /assets/{uuid}`. Asset Resolver stub: returns empty list (real impl will hit platform APIs). 17 tests nuevos. **85/85 pytest passing**.
 - **2026-09-06 13:48 UTC** — **Steps 7, 9, 11, 15, 17, 19 ✅ (state transitions + Render/QA routing)**. Commit `eed020a` con 15 archivos: modelos Candidate (Step 13-14) + Clip (Step 16-19) con FKs/CHECK/indexes, migraciones 0005+0006+0007 (incluye GIN index en jobs.payload), endpoints de candidates/clips, `app/services/job_state_transitions.py` con on_download_completed/ on_transcribe_completed/ on_render_completed/ on_qa_completed/ on_job_failed (auto-crea transcribe después de download, QA después de render, etc.), 28 tests nuevos. **105/105 pytest passing**.
-- **2026-09-06 13:52 UTC** — **Steps 3+13 ✅ (Campaign Engine skeleton)**. Commit `bf456ed` con 5 archivos: `app/campaign_engine/{models,parser,normalizer,__init__}.py` — stubs para que OpenClaw/Mini­Max parsee `source_instructions` a CampaignHints (regex para duration ranges "20-45s", format, language, captions, watermark, keywords) y luego normalize a NormalizedSpec con per-provider defaults. 19 tests nuevos. **124/124 pytest passing**. **Push al repo VPS bloqueado** esperando Device Flow `E8A8-95D4` (Molina debe autorizar para que yo cree `jarvismolinabot/clipping-system-vps`).
+- **2026-09-06 13:52 UTC** — **Steps 3+13 ✅ (Campaign Engine skeleton)**. Commit `bf456ed` con 5 archivos: `app/campaign_engine/{models,parser,normalizer,__init__}.py` — stubs para que OpenClaw/Mini­Max parsee `source_instructions` a CampaignHints (regex para duration ranges "20-45s", format, language, captions, watermark, keywords) y luego normalize a NormalizedSpec con per-provider defaults. 19 tests nuevos. **124/124 pytest passing**. `5e9aa44` pusheado después (push OK 16:18 UTC).
 - **2026-09-06 16:14 UTC** — **Verificación de estado por Clipper**. Sin cambios materiales en backend desde 13:52. Verificado: servicio `clipping-api.service` activo, 10 commits en local (sin push), API escuchando en `100.109.27.21:8080` (solo Tailscale, no localhost), `openclaw-gateway.service` activo. **Bloqueantes siguen iguales:**
-  - Git remote equivocado → Device Flow `E8A8-95D4` esperando OK de Molina para crear `jarvismolinabot/clipping-system-vps` y pushear.
+  - ~~Git remote equivocado~~ → ✅ RESUELTO (`5e9aa44` pusheado 16:18 UTC).
   - Bind API solo Tailscale → decisión pendiente de Molina.
   - **Steps OpenClaw PENDIENTES (no son backend, son mi trabajo de Clipper):** 1, 2, 12-14 (con LLM real, no regex), 20, 21.

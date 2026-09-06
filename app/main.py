@@ -45,6 +45,8 @@ from app.api.candidates import router as candidates_router  # noqa: E402
 app.include_router(candidates_router)
 from app.api.clips import router as clips_router  # noqa: E402
 app.include_router(clips_router)
+from app.api.clip_selection import router as clip_selection_router  # noqa: E402
+app.include_router(clip_selection_router)
 from app.models import candidate, clip  # noqa: E402,F401  # alembic model registration
 from app.models import asset  # noqa: E402,F401  # model registration for alembic
 from app.models import campaign  # noqa: E402,F401  # model registration for alembic

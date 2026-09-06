@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual env
+venv/
+.venv/
+env/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Entorno y secretos — NUNCA commitear
+.env
+.env.local
+.env.*.local
+.env.bak*
+*.bak
+
+# Logs runtime
+logs/
+*.log
+
+# Storage runtime (los assets reales no van al repo)
+storage/previews/
+storage/exports/
+storage/qa/
+storage/thumbnails/
+storage/.gitkeep
+
+# Migraciones compiladas de Alembic
+alembic/versions/__pycache__/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Tmp
+tmp/
+*.tmp

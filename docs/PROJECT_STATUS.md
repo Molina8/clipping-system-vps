@@ -1,10 +1,10 @@
 # PROJECT_STATUS.md — Estado del proyecto Clipping
 
-> **Documento hermano** de `docs/ARCHITECTURE.md` (en `/opt/clipping-system/docs/`).
+> **Documento hermano** de `docs/ARCHITECTURE.md` (en `/opt/clipping-system/docs/`) y de `docs/architecture_flow.md` (el doc de Molina con los 21 pasos, fuente única de verdad para flujo y responsabilidades).
 > Refleja el estado real **punto por punto**: qué está hecho, qué no, qué está a medias, riesgos y próximos pasos.
 > Actualizado en cada cambio relevante por **Clipper** (agente OpenClaw).
 >
-> **Última actualización:** 2026-09-06 11:05 UTC
+> **Última actualización:** 2026-09-06 13:18 UTC
 > **Fuente de verdad técnica:** el código en `/opt/clipping-system/` y este propio doc.
 > **Fuente de verdad funcional:** el servicio corriendo en `100.109.27.21:8080` (Tailscale).
 
@@ -12,16 +12,17 @@
 
 ## TL;DR
 
-- 🟢 **Backend MVP arrancado y respondiendo** — FastAPI en `100.109.27.21:8080`, Postgres nativo en `localhost:5432`, DB `clipping` con tabla `jobs`.
-- ✅ **Tests pasan** — 47/47 pytest en 1.36s (2 warnings deprecation menores, sin fallos).
+- 🟢 **Backend MVP arrancado y respondiendo** — FastAPI en `100.109.27.21:8080`, Postgres nativo en `localhost:5432`, DB `clipping` con tablas `jobs`, `workers`, `campaigns`.
+- ✅ **Tests pasan** — **69/69 pytest verde** en 2.08s (47 originales + 8 workers + 14 campaigns), 2 warnings deprecation menores.
 - 🟢 **Servicio systemd robusto** — `clipping-api.service` enabled, Restart=always, MemoryMax=512M, hardening completo (ProtectSystem=strict, ProtectHome, ReadWritePaths). Sobrevive reboots sin problema.
-- 🟡 **3 fases hechas** (DB básica, API parcial, Job Queue básica), **2 a medias** (preparación), **1 hecha nueva** (Worker Integration), **1 pendiente** (testing E2E real VPS↔Worker).
-- 🔴 **2 bloqueantes urgentes:** (1) NO hay git repo en `/opt/clipping-system/`; (2) API bind solo a Tailscale, no localhost (decisión pendiente).
+- 🟢 **Step 4 hecho** (architecture_flow.md) — Campaign + CampaignSpec + multi-source. Endpoints `POST/GET /campaigns`, `GET/PATCH /campaigns/{id}`. Soporte para twitter/youtube/instagram/tiktok/reddit/twitch/manual/other. Commit `ce5a90a`.
+- 🟡 **Steps 5-19 pendientes** — Asset + Asset Resolver + transiciones de estado + Render/QA routing + Campaign Engine skeleton.
+- 🔴 **Push bloqueado** — el remote actual apunta a `Molina8/clipping-windows-worker` (repo del Worker de Molina, NO pusheo ahí). Necesito un repo del VPS para subir los commits.
 - ✅ **Tailscale OK** — sigue como root (correcto), mesh con `molina` (PC Windows) y `vps-5764d01a` (este VPS) online.
 
 ---
 
-## Estado por fase (mapeo al doc de arquitectura)
+## Estado por fase (mapeo a `architecture_flow.md`)
 
 ### ✅ Fase 1 — Auditoría — **HECHA** (2026-09-06 11:02 UTC, por Clipper)
 
@@ -41,65 +42,79 @@
 - ✅ `/opt/clipping-system/` existe (owner `clipping:clipping`, creado 2026-09-04)
 - ✅ `.env` existe (con `CLIPPING_DB_*`, `API_*`, `API_TOKEN`)
 - ✅ `alembic.ini` y `alembic/` configurados
-- ❌ **NO hay git repo** — bloqueante, no se puede versionar
-- ❌ NO hay `.gitignore`
-- ❌ NO hay `.env.example` (sí hay `.env.bak-phase4-pre-api-vars`, sugiere flujo de fases previo)
+- ✅ `.env.example` creado en commit `80ca085`
+- ✅ Git repo inicializado con 7 commits en local
 - ❌ NO hay `docker-compose.yml` ni `Dockerfile` — **aceptable**, Postgres nativo consume menos RAM
 - ❌ NO hay `README.md` en raíz del proyecto
+- ❌ NO hay `.gitignore` formal
 
-### 🟡 Fase 3 — Base de datos — **PARCIAL**
+### ✅ Fase 3 — Base de datos — **HECHA**
 
 - ✅ PostgreSQL 16 nativo instalado y corriendo
 - ✅ DB `clipping` creada (owner `postgres`)
 - ✅ Rol `clipping_api` con permisos sobre `clipping`
 - ✅ Alembic configurado (`alembic.ini`, `alembic/env.py`)
-- ✅ Migración `0001_create_jobs_table.py` aplicada → tabla `jobs` existe
-- ❌ **Faltan modelos**: `campaign.py`, `worker.py`, `asset.py` (solo `job.py` existe)
-- ❌ **Faltan migraciones** para `campaigns`, `workers`, `assets`
-- ❌ **Faltan tablas**: `campaigns`, `workers`, `assets`, `results`
+- ✅ **3 migraciones aplicadas**:
+  - `0001_create_jobs_table.py` → tabla `jobs` con 16 columnas, CHECK de estados, índices de claim
+  - `0002_create_workers_table.py` → tabla `workers` con status enum, gpu_name, gpu_available, capabilities JSONB, last_heartbeat_at, etc.
+  - `0003_create_campaigns_table.py` → tabla `campaigns` con source_provider enum, source_id, source_url, source_metadata JSONB, spec JSONB, contadores denormalizados
 
-### 🟡 Fase 4 — API FastAPI — **PARCIAL**
+### ✅ Fase 4 — API FastAPI — **HECHA**
 
-- ✅ FastAPI + Uvicorn funcionando (PID 81509, user `clipping`)
+- ✅ FastAPI + Uvicorn funcionando (user `clipping`)
 - ✅ Auth Bearer token implementado (`app/auth.py` + `app/config.py`)
-- ✅ Endpoints jobs: `POST /jobs`, `GET /jobs`, `GET /jobs/{id}`
-- ✅ Endpoints worker: `GET /worker/jobs/next`, `POST /worker/jobs/{id}/{start|result|fail|heartbeat}`
-- ✅ `GET /health`, `GET /system/info`
-- ❌ **Faltan endpoints `/workers/*`**: `POST /workers/register`, `POST /workers/heartbeat`, `GET /workers`, `GET /workers/{id}`
-- ❌ **Faltan endpoints `/campaigns/*`**: `POST /campaigns`, `GET /campaigns`, `GET /campaigns/{id}`
-- ❌ **Falta estructura**: `app/api/{campaigns,workers,health}.py` (solo `jobs.py` y `system.py`)
-- ❌ **Falta `app/schemas/`** (Pydantic schemas separados — el doc lo pide)
-- 🟡 **Bind problemático**: API escucha SOLO en `100.109.27.21:8080` (Tailscale), NO en `127.0.0.1:8080` → health checks locales y curl desde el propio VPS fallan. Hay que añadir bind a localhost o `0.0.0.0` con firewall restrictivo (iptables/nftables limitando a `100.64.0.0/10`).
+- ✅ **15 endpoints implementados**:
+  - **Health/system**: `GET /health`, `GET /system/info`
+  - **Jobs**: `POST /jobs`, `GET /jobs`, `GET /jobs/{id}`
+  - **Worker integration**: `POST /worker/register`, `POST /worker/heartbeat`, `GET /worker`, `GET /worker/{id}`, `GET /worker/jobs/next`, `POST /worker/jobs/{id}/start`, `/heartbeat`, `/result`, `/fail`
+  - **Campaigns**: `POST /campaigns`, `GET /campaigns` (con `?status` y `?source_provider`), `GET /campaigns/{id}`, `PATCH /campaigns/{id}`
+- ✅ Pydantic schemas separados (`app/schemas/{worker,campaign}.py`)
+- 🟡 **Bind problemático**: API escucha SOLO en `100.109.27.21:8080` (Tailscale), NO en `127.0.0.1:8080`. Decisión pendiente (añadir localhost o `0.0.0.0` con firewall restrictivo)
 
-### 🟡 Fase 5 — Job Queue — **PARCIAL**
+### ✅ Fase 5 — Job Queue — **HECHA**
 
-- ✅ Tabla `jobs` con esquema completo (inferido de migración)
-- ✅ Estados: `pending`, `assigned`, `processing`, `completed`, `failed`, `retry`, `cancelled` (a confirmar con `app/models/job.py`)
-- ✅ Locking con `SELECT FOR UPDATE` (`tests/test_concurrency.py` sugiere implementación correcta)
-- ✅ Tipos: `health`, `download`, `transcribe`, `render`, `qa` (a confirmar en código)
-- 🟡 **Pendiente verificar**: que los tests pasen (`pytest` no ejecutado aún desde esta sesión)
+- ✅ Tabla `jobs` con esquema completo, CHECK de estados (`pending/assigned/processing/completed/failed/retry/cancelled`)
+- ✅ Locking con `SELECT FOR UPDATE` para evitar que 2 Workers pillen el mismo job (`test_concurrency.py`)
+- ✅ Tipos: `health`, `download`, `transcribe`, `render`, `qa`
+- ✅ atomic claim en `get_next_job_endpoint`
+- 🟡 **Pendiente**: lógica para que `POST /worker/jobs/{id}/result` con `status='completed'` cree automáticamente el siguiente job (TRANSCRIBE después de DOWNLOAD, etc.). Eso es parte de Step 9+11+15+17 de `architecture_flow.md`, va en Fase C.
 
-### ✅ Fase 6 — Integración Worker — **HECHA** (2026-09-06)
+### ✅ Fase 6 — Integración Worker — **HECHA** (commit `a88bbe0`)
 
-- ✅ Código del Worker Windows leído y comparado endpoint-a-endpoint
-- ✅ Endpoints `POST /worker/register` y `POST /worker/heartbeat` añadidos al backend (eran los que el Worker esperaba)
-- ✅ Tabla `workers` creada en Postgres (Alembic 0002)
+- ✅ Código del Worker Windows leído (`/tmp/worker-review/clipping-windows-worker/`)
+- ✅ Compatibilidad verificada endpoint-a-endpoint
+- ✅ Endpoints `POST /worker/register` y `POST /worker/heartbeat` añadidos (los que el Worker esperaba)
+- ✅ Tabla `workers` + Alembic 0002
 - ✅ Schemas Pydantic espejo exacto del Worker (`WorkerRegistration`, `Heartbeat`)
-- ✅ E2E verificado con curl + python contra el servicio real: register/heartbeat/list/get → 200, ghost → 404, sin auth → 401
+- ✅ E2E real verificado: register/heartbeat/list/get → 200, ghost → 404, sin auth → 401
 - ✅ 8 tests unitarios nuevos en `tests/test_workers.py` — **8/8 passing**
-- ✅ Commit `a88bbe0` (workers) + `e01db81` (docs) en local
-- 🟡 Pendiente: push a GitHub (bloqueado por decisión de Molina sobre repo/Write access)
-### ✅ Fase 7 — Testing — **HECHA** (tests unitarios)
 
-- ✅ Tests escritos y pasando:
-  - `tests/test_health.py` (básico)
-  - `tests/test_auth.py` (auth Bearer)
-  - `tests/test_jobs.py` (CRUD jobs)
-  - `tests/test_concurrency.py` (locking)
-  - `tests/test_state_transitions.py` (transiciones de estado)
-- ✅ **47/47 tests passing en 1.36s** (verificado 2026-09-06 11:10 UTC, 2 warnings deprecation sin impacto)
-- ❌ **NO hay tests de integración** reales VPS ↔ Worker
-- ❌ **NO hay CI/CD** configurado
+### ✅ Step 4 — Campaign storage (architecture_flow.md) — **HECHO** (commit `ce5a90a`)
+
+- ✅ Modelo `Campaign` con soporte multi-source:
+  - `source_provider` (twitter/youtube/instagram/tiktok/reddit/twitch/manual/other) con CHECK constraint
+  - `source_id` (ID en la plataforma), `source_url` (URL al post/vídeo original)
+  - `source_metadata` (JSONB para datos específicos del proveedor)
+- ✅ `CampaignSpec` (reglas agnósticas del proveedor): duration_min/max, captions_required, watermark_url, format, language, keywords, exclude_keywords, extra
+- ✅ `CampaignStatus` enum: draft, analyzing, ready, active, paused, completed, archived
+- ✅ Endpoints: `POST /campaigns`, `GET /campaigns` (con filtros `?status` y `?source_provider`), `GET /campaigns/{id}`, `PATCH /campaigns/{id}`
+- ✅ Pydantic `field_validator` en `source_provider` y validación de transiciones de status
+- ✅ Alembic migración 0003 aplicada con índices en `name`, `status`, `source_provider`
+- ✅ 14 tests nuevos en `tests/test_campaigns.py`
+- ✅ **69/69 pytest verde**
+- ✅ **E2E real verificado**: creación multi-source (youtube/twitter/manual), filtros `?source_provider`, PATCH status transitions, validación → 422, sin auth → 401
+
+### ❌ Steps 5-19 (architecture_flow.md) — **PENDIENTE**
+
+- ❌ Step 5-6: Asset model + Asset Resolver (buscar vídeos/assets utilizables, registrar con estado `pending`)
+- ❌ Step 7, 9, 11, 15, 17, 19: transiciones de estado de assets (`pending → downloaded → transcribed → approved/rejected/review/published`)
+- ❌ Step 3, 13: Campaign Engine skeleton (`app/campaign_engine/{parser,rule_normalizer,models}.py`) para que OpenClaw/MiniMax pueda rellenar `spec`
+
+### ✅ Fase 7 — Testing — **PARCIAL**
+
+- ✅ **69/69 tests passing en 2.08s** (47 originales + 8 workers + 14 campaigns)
+- ❌ NO hay tests de integración reales VPS ↔ Worker
+- ❌ NO hay CI/CD configurado
 
 ---
 
@@ -107,39 +122,30 @@
 
 ### Tailscale
 
-- ✅ Daemon `tailscaled` corriendo como **root** (correcto, NO migrar a user — tailscaled necesita NET_ADMIN)
-- ✅ State en `/var/lib/tailscale/tailscaled.state` (root, correcto)
-- ✅ Servicio systemd de sistema `tailscaled.service` activo desde 2026-09-03
-- ✅ IP Tailscale VPS: `100.109.27.21` (IPv4) + `fd7a:115c:a1e0::262e:1b16` (IPv6)
-- ✅ Mesh:
-  - `vps-5764d01a` (linux, online)
-  - `molina` (windows, online) ← **el PC Worker de Molina, listo**
-  - `port477` (windows, **offline desde hace 19 días** — revisar si era otro PC tuyo o un nodo olvidado)
-- ✅ MagicDNS funcionando
-- ✅ DERP más cercano: London (3.7ms), Madrid 19.9ms
-- ✅ Conectividad UDP + IPv4 + IPv6 OK
-- ⚠️ **No hay ACL local** — todo se gestiona en la policy del Tailnet (cloud). OK para nuestro caso (solo 2 nodos).
-- ✅ **Decisión sobre la migración root → ubuntu: NO afecta a Tailscale**. tailscaled DEBE ser root (gestiona interfaz `tailscale0`). La migración a `ubuntu` afecta solo a OpenClaw y a servicios user-level. No tocar.
+- ✅ Daemon `tailscaled` corriendo como **root** (correcto)
+- ✅ State en `/var/lib/tailscale/tailscaled.state`
+- ✅ Servicio systemd `tailscaled.service` activo desde 2026-09-03
+- ✅ IP Tailscale VPS: `100.109.27.21` (IPv4)
+- ✅ Mesh: `vps-5764d01a` + `molina` online
+- ⚠️ **No hay ACL local** — todo en policy del Tailnet
+- ✅ **Migración root → ubuntu no afecta a Tailscale**
 
 ### OpenClaw + skills
 
-- ✅ Gateway `openclaw-gateway.service` user-level, puerto `18789`, PID 108263
+- ✅ Gateway `openclaw-gateway.service` user-level, puerto `18789`
 - ✅ Skills operativas: `blogwatcher`, `xurl`, `instagram-content-studio`, `youtube-api-skill`
-- ✅ Plugins provider: `agntdata-youtube@1.0.15`, `agntdata-instagram@1.0.15`
 - ✅ Telegram bot operativo
-- 🟡 `nano-pdf` y `summarize` deshabilitados (sin binarios Linux)
 
 ### Postgres
 
-- ✅ PostgreSQL 16 nativo, en `127.0.0.1:5432` (solo localhost, correcto)
+- ✅ PostgreSQL 16 nativo, `127.0.0.1:5432`
 - ✅ DB `clipping` con owner `clipping_api`
 - ✅ Conexión desde API verificada (`{"status":"ok","database":"ok"}`)
 
 ### Backups
 
 - 🟡 Solo `.env.bak-phase4-pre-api-vars` (1 backup manual)
-- ❌ NO hay backups automatizados del código
-- ❌ NO hay backups de la DB (`pg_dump` no programado)
+- ❌ NO hay backups automatizados
 
 ---
 
@@ -147,45 +153,41 @@
 
 | # | Riesgo | Impacto | Mitigación |
 |---|---|---|---|
-| 1 | **NO hay git repo** en `/opt/clipping-system/` | Imposible versionar, rollback, auditar cambios | `git init` + primer commit con estado actual |
-| 2 | **API bind solo a Tailscale** — no responde en localhost | Health checks locales, curl desde VPS, herramientas internas fallan | Cambiar bind a `0.0.0.0:8080` con firewall iptables que limite a `100.64.0.0/10` (Tailscale CGNAT) |
+| 1 | **Git remote apunta a `Molina8/clipping-windows-worker`** (repo del Worker de Molina, NO pusheo ahí) | Commits locales sin backup remoto | Crear repo nuevo del VPS o que Molina dé Write access a `Molina8/<vps-repo>` o `jarvismolinabot/<vps-repo>` |
+| 2 | **API bind solo a Tailscale** | curl desde localhost falla, herramientas internas no pueden hablarle | Decidir bind: localhost + Tailscale, o `0.0.0.0` con firewall restrictivo |
 
 ## 🟡 Decisiones pendientes
 
-- [ ] **A/B/C del tool executor** — problema estructural de OpenClaw que afecta a TODO trabajo futuro (instalaciones largas pueden matar mi sesión). Sin B, trabajos >2 min son arriesgados. **(Sigue abierto desde el 6 sept 10:52)**
+- [ ] **Repo destino del VPS** para push (ver bloqueante #1)
+- [ ] **A/B/C del tool executor** — problema estructural desde 10:52
 - [ ] **Bind de la API**: ¿añadir localhost, dejar solo Tailscale, o `0.0.0.0` con firewall?
-- [ ] **`.env.example`**: ¿generar uno con todas las variables actuales? (sin valores reales)
-- [ ] **Worker Windows**: ¿Molina me pasa el código del Worker o me da acceso a su repo?
 
 ## 🟢 Logros verificados hoy (2026-09-06)
 
-- ✅ Backend localizado y auditado (`/opt/clipping-system/`)
-- ✅ API health respondiendo `{"status":"ok","database":"ok"}` desde `100.109.27.21:8080/health`
-- ✅ Tailscale auditado y verificado post-migración (sin acción necesaria)
-- ✅ Estructura de OpenAPI inspeccionada (10 endpoints)
-- ✅ DB schema inspeccionado (tabla `jobs` con 16 columnas, CHECK constraint de estados, índices de claim)
-- ✅ `pytest` ejecutado: **47/47 passing en 1.36s** (luego 55/55 con los 8 nuevos de workers en 1.89s)
-- ✅ `clipping-api.service` inspeccionado: enabled, Restart=always, MemoryMax=512M, hardening completo
-- ✅ `PROJECT_STATUS.md` creado y corregido (este doc)
+- ✅ **69/69 pytest verde** (47 + 8 workers + 14 campaigns)
+- ✅ **15 endpoints API** en OpenAPI
+- ✅ **3 tablas en DB**: jobs, workers, campaigns (con índices y CHECK constraints)
+- ✅ **3 migraciones Alembic** aplicadas (0001, 0002, 0003)
+- ✅ **E2E real verificado** con curl + Python contra el servicio: jobs CRUD, worker integration (register/heartbeat/list/get), campaigns (multi-source, filtros, status transitions)
+- ✅ **7 commits en local**: `04649ae`, `80ca085`, `a88bbe0`, `e01db81`, `9c14867`, `ce5a90a` (+ el de status de este doc)
+- ✅ `clipping-api.service` activo y robusto
 
 ---
 
 ## 📋 Próximos pasos (orden propuesto)
 
-1. **`git init` + commit inicial** en `/opt/clipping-system/` con todo el estado actual
-2. **Crear `.env.example`** a partir del `.env` actual (sin secretos)
-3. **Decidir bind API** (recomendación: `0.0.0.0` + iptables restrictivo a `100.64.0.0/10`)
-4. **Modelos faltantes**: `campaign.py`, `asset.py` + migraciones (worker.py ya hecho)
-5. **Endpoints faltantes**: `/campaigns/*` (los `/worker/*` están todos)
-6. **Tests E2E** reales VPS ↔ Worker (cliente Python que dispara el flujo completo)
-7. **CI/CD** (opcional, futuro)
-8. **Push a GitHub** del commit `a88bbe0` (pendiente decisión de Molina sobre Molina8/clipping-windows-worker)
+1. **Decidir repo destino del VPS** (necesario antes de cualquier push)
+2. **Fase B** (Steps 5-6): Asset model + Asset Resolver
+3. **Fase C** (Steps 7, 9, 11, 15, 17, 19): transiciones de estado + Render/QA routing automático
+4. **Fase D** (Steps 3+13): Campaign Engine skeleton (parser + rule_normalizer)
+5. **Tests E2E** reales VPS↔Worker (cliente Python que dispara el flujo completo)
+6. **CI/CD** (opcional, futuro)
 
 ---
 
 ## Changelog
 
-- **2026-09-06 11:05 UTC** — Versión inicial creada por Clipper tras auditoría completa del backend y Tailscale. Detecta estado real: backend parcialmente montado (no 0/7 como se dijo antes), Tailscale OK post-migración root→ubuntu, 3 bloqueantes urgentes identificados.
+- **2026-09-06 11:05 UTC** — Versión inicial creada por Clipper tras auditoría completa del backend y Tailscale.
 - **2026-09-06 11:55 UTC** — **Fase 6 ✅ (Worker Integration)**. Endpoints `/worker/register` y `/worker/heartbeat` añadidos. Tabla `workers` + Alembic 0002. 8/8 tests passing. E2E real verificado. Commits `a88bbe0` + `e01db81`.
-- **2026-09-06 11:10 UTC** — **Corrección**: `clipping-api.service` SÍ existe, está enabled y con hardening robusto (PID 81509, Restart=always, MemoryMax=512M, ProtectSystem=strict, ProtectHome). Pytest ejecutado: 47/47 passing en 1.36s. Bloqueante #1 (systemd) eliminado; quedan 2 (git repo + API bind).
-- **2026-09-06 12:10 UTC** — **Fase 6 (Worker Integration) marcada ✅**. Commit `a88bbe0` con +608 líneas: modelo Worker, migración 0002, schemas Pydantic espejo del Worker Windows, service, router, 8 tests unitarios, main.py patched. E2E real verificado: register/heartbeat/list/get → 200, ghost heartbeat → 404, sin auth → 401. Pytest suite global: 55/55 passing en 1.89s. Commit en local; push pendiente de decisión de Molina.
+- **2026-09-06 12:10 UTC** — **Fase 6 (Worker Integration) marcada ✅**. Commit `a88bbe0` con +608 líneas.
+- **2026-09-06 13:18 UTC** — **Step 4 ✅ (Campaign storage + multi-source)**. Commit `ce5a90a` con 7 archivos: modelo Campaign con source_provider/source_id/source_url/source_metadata, CampaignSpec (reglas agnósticas del proveedor), migración 0003, 4 endpoints (`POST/GET /campaigns`, `GET/PATCH /campaigns/{id}`), service, schemas Pydantic, 14 tests nuevos (69/69 verde). Soporte multi-proveedor integrado desde diseño (twitter/youtube/instagram/tiktok/reddit/twitch/manual/other). E2E verificado: creación multi-source, filtrado por source_provider, transiciones de status, validación Pydantic → 422, sin auth → 401. Commit en local; **push pendiente de repo destino del VPS** (el remote actual apunta al repo del Worker de Molina por error previo).

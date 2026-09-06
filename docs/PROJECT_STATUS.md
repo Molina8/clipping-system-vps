@@ -213,9 +213,37 @@
 1. ✅ ~~Device Flow `E8A8-95D4`~~ Resuelto (`5e9aa44` en main).
 2. ✅ ~~Step 12-13 — agente LLM Clipper~~ Resuelto (`9218bba` en main, `app/clip_selection/` con agent+validator+MockLLMClient).
 3. ✅ ~~Step 14 — candidate lifecycle (approve→RENDER + reject)~~ Resuelto (`ee7baf1` en main, `app/services/candidate_lifecycle.py`).
-4. **Bind API**: localhost + Tailscale, o `0.0.0.0` con firewall. Decisión Molina.
-5. **Test E2E real VPS↔Worker** (cliente Python que dispara el flujo completo: register → heartbeat → claim → execute → upload).
-6. **CI/CD** (opcional, futuro).
+4. **Step 1+2** — CRON que escanea fuentes + LLM que decide cuáles campañas interesan. **No existe.**
+5. **Asset Resolver real** (multi-source collector: twitter/youtube/instagram/tiktok/reddit/twitch). Stub actual devuelve `[]`.
+6. **HttpLLMClient con credenciales reales** (openai/anthropic/minimax-portal en `.env`) para reemplazar `MockLLMClient`.
+7. **Bind API**: localhost + Tailscale, o `0.0.0.0` con firewall. Decisión Molina.
+8. **Test E2E real VPS↔Worker** (cliente Python que dispara el flujo completo: register → heartbeat → claim → execute → upload).
+9. **CI/CD** (opcional, futuro).
+
+## 🔌 Subsistema de campañas — estado al 2026-09-06 16:54 UTC
+
+### Worker Windows — ✅ YA ESTÁ HECHO
+- **No es ❌ falta.** El Worker Windows YA está integrado vía API (commit `a88bbe0`, Fase 6 ✅ cerrado). Endpoints `/worker/register` + `/worker/heartbeat` añadidos. Tabla `workers` + Alembic 0002. Schemas Pydantic espejo del Worker. E2E real verificado.
+- **Territorio:** PC Windows de Molina, no se toca desde aquí. Errores previos: en reportes anteriores se marcó como ❌ falta; corregido.
+
+### Cómo obtener campañas activas HOY
+- `GET /campaigns?status=active` — lista todas con `status='active'`. Filtros extra: `?source_provider=youtube`, `?limit=&offset=`.
+- `GET /campaigns/{id}` — una campaña concreta por id.
+- `POST /campaigns` — crear (auth Bearer, status inicial `draft` por defecto).
+- **Hoy solo se crean campañas manuales** vía API. NO hay collector de Twitter/YouTube/etc.
+
+### Requisitos para crear una campaña (`POST /campaigns`)
+- **Obligatorio:** `name` (str, 1-256, único).
+- **Opcionales:** `source_provider` (default `'manual'`), `source_instructions` (texto libre con las reglas), `spec` (CampaignSpec JSONB precomputado), `source_id`, `source_url`, `source_metadata`.
+- **Transición de status:** `draft` → `analyzing` → `ready` → `active` → `paused` → `completed`/`archived`. Se hace con `PATCH /campaigns/{id}` con `{"status": "..."}`.
+
+### Reglas (CampaignSpec)
+- **Pipeline:** `source_instructions` (texto) → `parser.parse_instructions()` → `CampaignHints` (regex) → `normalizer.normalize()` → `NormalizedSpec` → `Campaign.spec` JSONB.
+- **Campos del spec:** `duration_min`, `duration_max`, `captions_required`, `watermark_url`, `format`, `language`, `keywords`, `exclude_keywords`, `extra`.
+- **Defaults por provider:** twitter→16:9/en/15-140, youtube→9:16/en/30-60, tiktok→9:16/en/15-180, instagram→1:1/en/3-90, manual→9:16/es/20-60. Hints ganan sobre defaults; `max <= min` se fuerza a `max = min + 10`.
+- **Parser actual:** stub regex (no LLM real). Fix reciente: `_EXCLUDE_RE` acepta `:` y `=` como separador.
+- **Usado en:** step 13 (clip_selection agent, re-deriva spec en cada propuesta) + step 14 (candidate_lifecycle, valida antes de auto-RENDER).
+- **Lo que falta:** real LLM call (skeleton `HttpLLMClient` listo, sin credenciales en `.env`).
 
 ---
 

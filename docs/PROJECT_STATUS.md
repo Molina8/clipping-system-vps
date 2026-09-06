@@ -15,7 +15,7 @@
 - 🟢 **Backend MVP arrancado y respondiendo** — FastAPI en `100.109.27.21:8080`, Postgres nativo en `localhost:5432`, DB `clipping` con tabla `jobs`.
 - ✅ **Tests pasan** — 47/47 pytest en 1.36s (2 warnings deprecation menores, sin fallos).
 - 🟢 **Servicio systemd robusto** — `clipping-api.service` enabled, Restart=always, MemoryMax=512M, hardening completo (ProtectSystem=strict, ProtectHome, ReadWritePaths). Sobrevive reboots sin problema.
-- 🟡 **3 fases hechas** (DB básica, API parcial, Job Queue básica), **2 a medias** (preparación e integración Worker), **2 pendientes** (Worker integration, testing E2E real).
+- 🟡 **3 fases hechas** (DB básica, API parcial, Job Queue básica), **2 a medias** (preparación), **1 hecha nueva** (Worker Integration), **1 pendiente** (testing E2E real VPS↔Worker).
 - 🔴 **2 bloqueantes urgentes:** (1) NO hay git repo en `/opt/clipping-system/`; (2) API bind solo a Tailscale, no localhost (decisión pendiente).
 - ✅ **Tailscale OK** — sigue como root (correcto), mesh con `molina` (PC Windows) y `vps-5764d01a` (este VPS) online.
 
@@ -79,13 +79,16 @@
 - ✅ Tipos: `health`, `download`, `transcribe`, `render`, `qa` (a confirmar en código)
 - 🟡 **Pendiente verificar**: que los tests pasen (`pytest` no ejecutado aún desde esta sesión)
 
-### ❌ Fase 6 — Integración Worker — **NO HECHA**
+### ✅ Fase 6 — Integración Worker — **HECHA** (2026-09-06)
 
-- ❌ Clipper NO ha leído el código del Worker Windows de Molina
-- ❌ NO hay análisis de compatibilidad endpoint-a-endpoint
-- ❌ NO se han identificado qué cambios exactos en `.env` del Worker Windows
-- ❌ NO se ha hecho test E2E real VPS ↔ Worker
-
+- ✅ Código del Worker Windows leído y comparado endpoint-a-endpoint
+- ✅ Endpoints `POST /worker/register` y `POST /worker/heartbeat` añadidos al backend (eran los que el Worker esperaba)
+- ✅ Tabla `workers` creada en Postgres (Alembic 0002)
+- ✅ Schemas Pydantic espejo exacto del Worker (`WorkerRegistration`, `Heartbeat`)
+- ✅ E2E verificado con curl + python contra el servicio real: register/heartbeat/list/get → 200, ghost → 404, sin auth → 401
+- ✅ 8 tests unitarios nuevos en `tests/test_workers.py` — **8/8 passing**
+- ✅ Commit `a88bbe0` (workers) + `e01db81` (docs) en local
+- 🟡 Pendiente: push a GitHub (bloqueado por decisión de Molina sobre repo/Write access)
 ### ✅ Fase 7 — Testing — **HECHA** (tests unitarios)
 
 - ✅ Tests escritos y pasando:
@@ -161,7 +164,7 @@
 - ✅ Tailscale auditado y verificado post-migración (sin acción necesaria)
 - ✅ Estructura de OpenAPI inspeccionada (10 endpoints)
 - ✅ DB schema inspeccionado (tabla `jobs` con 16 columnas, CHECK constraint de estados, índices de claim)
-- ✅ `pytest` ejecutado: **47/47 passing en 1.36s**
+- ✅ `pytest` ejecutado: **47/47 passing en 1.36s** (luego 55/55 con los 8 nuevos de workers en 1.89s)
 - ✅ `clipping-api.service` inspeccionado: enabled, Restart=always, MemoryMax=512M, hardening completo
 - ✅ `PROJECT_STATUS.md` creado y corregido (este doc)
 
@@ -172,15 +175,17 @@
 1. **`git init` + commit inicial** en `/opt/clipping-system/` con todo el estado actual
 2. **Crear `.env.example`** a partir del `.env` actual (sin secretos)
 3. **Decidir bind API** (recomendación: `0.0.0.0` + iptables restrictivo a `100.64.0.0/10`)
-4. **Worker integration**: leer código del Worker Windows de Molina y validar compat
-5. **Modelos faltantes**: `campaign.py`, `worker.py`, `asset.py` + migraciones
-6. **Endpoints faltantes**: `/workers/*` y `/campaigns/*`
-7. **Tests E2E** reales VPS ↔ Worker
-8. **CI/CD** (opcional, futuro)
+4. **Modelos faltantes**: `campaign.py`, `asset.py` + migraciones (worker.py ya hecho)
+5. **Endpoints faltantes**: `/campaigns/*` (los `/worker/*` están todos)
+6. **Tests E2E** reales VPS ↔ Worker (cliente Python que dispara el flujo completo)
+7. **CI/CD** (opcional, futuro)
+8. **Push a GitHub** del commit `a88bbe0` (pendiente decisión de Molina sobre Molina8/clipping-windows-worker)
 
 ---
 
 ## Changelog
 
 - **2026-09-06 11:05 UTC** — Versión inicial creada por Clipper tras auditoría completa del backend y Tailscale. Detecta estado real: backend parcialmente montado (no 0/7 como se dijo antes), Tailscale OK post-migración root→ubuntu, 3 bloqueantes urgentes identificados.
+- **2026-09-06 11:55 UTC** — **Fase 6 ✅ (Worker Integration)**. Endpoints `/worker/register` y `/worker/heartbeat` añadidos. Tabla `workers` + Alembic 0002. 8/8 tests passing. E2E real verificado. Commits `a88bbe0` + `e01db81`.
 - **2026-09-06 11:10 UTC** — **Corrección**: `clipping-api.service` SÍ existe, está enabled y con hardening robusto (PID 81509, Restart=always, MemoryMax=512M, ProtectSystem=strict, ProtectHome). Pytest ejecutado: 47/47 passing en 1.36s. Bloqueante #1 (systemd) eliminado; quedan 2 (git repo + API bind).
+- **2026-09-06 12:10 UTC** — **Fase 6 (Worker Integration) marcada ✅**. Commit `a88bbe0` con +608 líneas: modelo Worker, migración 0002, schemas Pydantic espejo del Worker Windows, service, router, 8 tests unitarios, main.py patched. E2E real verificado: register/heartbeat/list/get → 200, ghost heartbeat → 404, sin auth → 401. Pytest suite global: 55/55 passing en 1.89s. Commit en local; push pendiente de decisión de Molina.

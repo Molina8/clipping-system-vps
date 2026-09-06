@@ -4,7 +4,7 @@
 > Refleja el estado real **punto por punto**: qué está hecho, qué no, qué está a medias, riesgos y próximos pasos.
 > Actualizado en cada cambio relevante por **Clipper** (agente OpenClaw).
 >
-> **Última actualización:** 2026-09-06 16:42 UTC
+> **Última actualización:** 2026-09-06 20:18 UTC
 > **Verificación de estado:** backend operativo y revisado por Clipper ahora mismo.
 > **Fuente de verdad técnica:** el código en `/opt/clipping-system/` y este propio doc.
 > **Fuente de verdad funcional:** el servicio corriendo en `100.109.27.21:8080` (Tailscale).
@@ -246,6 +246,23 @@
 - **Lo que falta:** real LLM call (skeleton `HttpLLMClient` listo, sin credenciales en `.env`).
 
 ---
+
+## Whop integration — estado 2026-09-06 20:18 UTC
+
+**Hallazgos del día (Whop OAuth + API testing):**
+- Account API keys de Whop **NO cruzan businesses** — la key de Codiant (`biz_F6pWuwRIJXpn5f`) solo lee su propia cuenta, no otras (probado: 401 al listar `biz_kVYmkVBmvnLGHa`).
+- Para acceder a un business "X" se necesita: (a) Account API key generada en el dashboard de X, o (b) App API key con app instalada en X, o (c) OAuth app aprobada por X.
+- Marketplace search (`/products?query=`) es público y funciona con cualquier key válida — útil para descubrir qué companies tienen productos visibles.
+- Los scopes OAuth de Whop no se exponen al crear App en dashboard — Whop pide justificación formal para scopes como `read:experiences` o `access_pass:basic:read`.
+- Pattern URL → business id: `whop.com/<route>/...` → buscar en marketplace con el route o con el nombre del product para obtener `biz_XXX`.
+
+**Estado actual del proyecto (Whop):**
+- Key de Codiant rotada y validada: `/accounts/me`, `/experiences`, `/products` → 200 OK.
+- Codiant tiene 1 experience ("Public forum") + 1 product ("openclaw", test). No es donde están las campañas reales.
+- "Content Rewards" de Molina vive en OTRO business (`biz_kVYmkVBmvnLGHa` = "ViralYa ClippingCulture"). Sin API key de ese business, no se puede leer via API.
+- Skill `whop-integration` construido en `~/.openclaw/workspace/whop-integration/` (SKILL.md + scripts + whop_client + tests) pero no deployado en `/opt/clipping-system/` ni probado end-to-end.
+
+**Para retomar:** Molina debe elegir entre (a) generar API key de ViralYa desde su dashboard, (b) OAuth flow con app aprobada en ViralYa, o (c) pegar URLs manualmente.
 
 ## Changelog
 

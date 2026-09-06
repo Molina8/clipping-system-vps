@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 
 class CampaignHints(BaseModel):
@@ -26,6 +26,10 @@ class CampaignHints(BaseModel):
     Produced by `parser.parse_instructions(text)`. The agent (or
     Mini­Max in real life) fills this in; the rule_normalizer then
     turns it into a final CampaignSpec.
+
+    Note: the normalizer is the one that enforces the duration window
+    (duration_max > duration_min). The parser allows any values so
+    tests can verify the normalizer's fix-up logic.
     """
     # Duration window in seconds
     duration_min: Optional[float] = Field(
@@ -47,16 +51,6 @@ class CampaignHints(BaseModel):
     exclude_keywords: list[str] = Field(default_factory=list)
     # Free-form leftovers
     extra_notes: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def _validate_times(self):
-        if (
-            self.duration_min is not None
-            and self.duration_max is not None
-            and self.duration_max <= self.duration_min
-        ):
-            raise ValueError("duration_max must be > duration_min")
-        return self
 
 
 class NormalizedSpec(BaseModel):

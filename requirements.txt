@@ -1,0 +1,27 @@
+# Clipping system backend dependencies
+# Pinned to versions in use as of 2026-09-07.
+
+# Web framework
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn==0.52.4
+
+# Data validation & settings
+pydantic==2.13.5
+pydantic-settings==2.15.0
+pydantic_core==2.46.5
+
+# Database
+SQLAlchemy==2.0.52
+alembic==1.19.2
+psycopg2-binary==2.9.12
+
+# HTTP clients
+httpx==0.28.1           # Async + TestClient
+requests==2.34.2        # Sync HTTP for whop_integration / 3rd-party scrapers
+
+# Config loading
+python-dotenv==1.2.3
+
+# Test runner
+pytest==9.1.1

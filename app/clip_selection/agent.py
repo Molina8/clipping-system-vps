@@ -34,6 +34,35 @@ from .validator import filter_valid
 logger = logging.getLogger(__name__)
 
 
+def _strip_json_fences(raw: str) -> str:
+    """Strip markdown code fences that LLMs sometimes add to JSON responses.
+
+    LLMs (especially Anthropic-compatible APIs like MiniMax) often wrap
+    JSON output in triple-backtick code fences. This helper removes the
+    opening and closing fences and returns the inner JSON string so
+    pydantic's model_validate_json can parse it.
+
+    Examples (after Python escape interpretation):
+        json + {"x": 1} + ```  ->  {"x": 1}
+        ``` + {"x": 1} + ```    ->  {"x": 1}
+        {"x": 1}              ->  {"x": 1}  (unchanged)
+    """
+    s = raw.strip()
+    if not s.startswith("```"):
+        return s
+    # Drop the opening fence line (```json, ```JSON, or ```)
+    nl = s.find("\n")
+    if nl < 0:
+        return s
+    s = s[nl + 1:]
+    # Drop the closing fence if present
+    if s.endswith("```"):
+        s = s[:-3].strip()
+    return s
+
+
+
+
 class ClipSelectionAgent:
     """Orchestrates clip selection for one asset at a time."""
 
@@ -94,8 +123,13 @@ class ClipSelectionAgent:
             )
 
         # --- 5. Parse LLM response ---------------------------------------
+        # LLMs (especially Minimax via Anthropic-compatible API) often wrap
+        # their JSON output in markdown code fences like ```json\n{...}\n```.
+        # Strip those before parsing so we don't fail on valid responses.
         try:
-            response = ClipSelectionResponse.model_validate_json(raw_text)
+            response = ClipSelectionResponse.model_validate_json(
+                _strip_json_fences(raw_text)
+            )
         except (ValueError, json.JSONDecodeError) as e:
             logger.exception("LLM response parse failed for asset %s: %s", asset_id, e)
             return self._summary(

@@ -1,6 +1,7 @@
 """Tests for clip selection: validator, MockLLMClient, agent, endpoints."""
 from __future__ import annotations
 
+from app.clip_selection.agent import ClipSelectionAgent, _strip_json_fences
 import json
 import uuid
 from typing import Any, Dict, List
@@ -13,18 +14,15 @@ from app.config import settings
 from app.db.database import SessionLocal
 from app.main import app
 
-
 # --- Fixtures --------------------------------------------------------------
 
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(app)
 
-
 @pytest.fixture
 def auth_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {settings.api_token}"}
-
 
 @pytest.fixture
 def db():
@@ -38,7 +36,6 @@ def db():
         yield session
     finally:
         session.close()
-
 
 def _seed_transcribed(db) -> tuple[Any, Any]:
     """Create a campaign + asset in 'transcribed' status with a fake
@@ -94,7 +91,6 @@ def _seed_transcribed(db) -> tuple[Any, Any]:
     db.refresh(a)
     return c, a
 
-
 # --- Validator tests -------------------------------------------------------
 
 def test_validator_rejects_too_short():
@@ -114,7 +110,6 @@ def test_validator_rejects_too_short():
     assert not ok
     assert "too short" in reason
 
-
 def test_validator_rejects_too_long():
     from app.campaign_engine.models import NormalizedSpec
     from app.clip_selection.models import ClipProposal
@@ -131,7 +126,6 @@ def test_validator_rejects_too_long():
     ok, reason = validate_proposal(p, spec, "any text")
     assert not ok
     assert "too long" in reason
-
 
 def test_validator_rejects_excluded_keyword():
     from app.campaign_engine.models import NormalizedSpec
@@ -151,7 +145,6 @@ def test_validator_rejects_excluded_keyword():
     assert not ok
     assert "spoiler" in reason
 
-
 def test_validator_passes_good_proposal():
     from app.campaign_engine.models import NormalizedSpec
     from app.clip_selection.models import ClipProposal
@@ -167,7 +160,6 @@ def test_validator_passes_good_proposal():
     )
     ok, reason = validate_proposal(p, spec, "any text")
     assert ok, reason
-
 
 # --- MockLLMClient tests ---------------------------------------------------
 
@@ -202,7 +194,6 @@ def test_mock_llm_returns_proposals_within_window():
         duration = float(prop["end_time"]) - float(prop["start_time"])
         assert 17.0 < duration < 80.0  # 0.9 * 20 = 18, 1.1 * 60 = 66 ; loose
 
-
 def test_mock_llm_returns_empty_on_missing_duration():
     from app.clip_selection.llm_client import MockLLMClient
 
@@ -211,11 +202,10 @@ def test_mock_llm_returns_empty_on_missing_duration():
     payload = json.loads(raw)
     assert payload["proposals"] == []
 
-
 # --- Agent tests -----------------------------------------------------------
 
 def test_agent_persists_valid_proposals_and_marks_asset(db):
-    from app.clip_selection.agent import ClipSelectionAgent
+    from app.clip_selection.agent import ClipSelectionAgent, _strip_json_fences
 
     _c, asset = _seed_transcribed(db)
     agent = ClipSelectionAgent()
@@ -223,7 +213,6 @@ def test_agent_persists_valid_proposals_and_marks_asset(db):
     assert result["asset_id"] == str(asset.id)
     db.refresh(asset)
     assert "clip_selection_at" in (asset.extra_metadata or {})
-
 
 def test_agent_rejects_non_transcribed(db):
     from app.models.asset import Asset, AssetStatus
@@ -250,14 +239,12 @@ def test_agent_rejects_non_transcribed(db):
     with pytest.raises(ValueError):
         agent.run(db, str(a.id))
 
-
 def test_agent_rejects_unknown_asset(db):
     from app.clip_selection.agent import ClipSelectionAgent
 
     agent = ClipSelectionAgent()
     with pytest.raises(ValueError):
         agent.run(db, str(uuid.uuid4()))
-
 
 def test_agent_uses_custom_llm_client(db):
     from app.clip_selection.agent import ClipSelectionAgent
@@ -286,7 +273,6 @@ def test_agent_uses_custom_llm_client(db):
     assert result["persisted"] == 1
     assert result["candidates"][0]["score"] == 0.9
 
-
 # --- Endpoint tests --------------------------------------------------------
 
 def test_process_endpoint_returns_summary(client, auth_headers, db):
@@ -300,14 +286,12 @@ def test_process_endpoint_returns_summary(client, auth_headers, db):
     assert data["asset_id"] == str(asset.id)
     assert "persisted" in data
 
-
 def test_process_endpoint_404_for_unknown(client, auth_headers):
     r = client.post(
         f"/clip_selection/process/{uuid.uuid4()}",
         headers=auth_headers,
     )
     assert r.status_code == 404
-
 
 def test_queue_endpoint_lists_pending(client, auth_headers, db):
     _seed_transcribed(db)
@@ -316,7 +300,6 @@ def test_queue_endpoint_lists_pending(client, auth_headers, db):
     body = r.json()
     assert "pending" in body
     assert isinstance(body["pending"], list)
-
 
 def test_process_all_endpoint_runs(client, auth_headers, db):
     _seed_transcribed(db)
@@ -329,9 +312,41 @@ def test_process_all_endpoint_runs(client, auth_headers, db):
     assert "processed" in data
     assert "results" in data
 
-
 def test_clip_selection_requires_auth(client):
     r = client.post(
         f"/clip_selection/process/{uuid.uuid4()}",
     )
     assert r.status_code in (401, 403)
+
+class TestStripJsonFences:
+    """_strip_json_fences must handle the markdown-wrapped JSON that
+    Minimax (and other LLMs) frequently returns."""
+
+    def test_strips_json_fence(self):
+        raw = '```json\n{"proposals": [{"start_time": 0.0, "end_time": 30.0, "score": 0.8, "reasoning": "ok"}]}\n```'
+        out = _strip_json_fences(raw)
+        assert '"proposals"' in out
+        assert out.strip().startswith("{")
+        assert out.strip().endswith("}")
+
+    def test_strips_bare_fence_no_lang(self):
+        raw = '```\n{"x": 1}\n```'
+        assert _strip_json_fences(raw) == '{"x": 1}'
+
+    def test_strips_uppercase_json_fence(self):
+        raw = '```JSON\n{"x": 1}\n```'
+        assert _strip_json_fences(raw) == '{"x": 1}'
+
+    def test_passes_through_clean_json(self):
+        clean = '{"proposals": []}'
+        assert _strip_json_fences(clean) == clean
+
+    def test_handles_internal_whitespace(self):
+        raw = '   ```json\n  {"x": 1}\n```  '
+        assert _strip_json_fences(raw) == '{"x": 1}'
+
+    def test_does_not_strip_unrelated_backticks(self):
+        raw = "Note: use ```code``` for code blocks, then JSON: {\"x\": 1}"
+        # No opening triple-backtick at start; should pass through.
+        out = _strip_json_fences(raw)
+        assert out == raw

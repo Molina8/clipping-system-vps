@@ -52,11 +52,15 @@ def list_transcribed_assets(db, asset_id):
 
 
 def maybe_auto_approve(db, candidates, threshold):
-    """Auto-approve candidates with score >= threshold via candidate_lifecycle."""
+    """Auto-approve candidates with score >= threshold via candidate_lifecycle.
+
+    `candidates` here are summary dicts from agent.run() (NOT ORM Candidate
+    objects), so we read score from `cand["score"]` not `cand.extra_metadata`.
+    """
     from app.services.candidate_lifecycle import approve_candidate
     approved = 0
     for cand in candidates:
-        score = float((cand.extra_metadata or {}).get("score") or 0.0)
+        score = float((cand or {}).get("score") or 0.0)
         if score >= threshold:
             try:
                 approve_candidate(db, cand.id, approve=True)

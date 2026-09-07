@@ -89,6 +89,11 @@ class ClipSelectionAgent:
                 f"asset {asset_id} is not transcribed "
                 f"(current status: {asset.status})"
             )
+        logger.info(
+            "clip_selection.start asset=%s campaign_id=%d model=%s",
+            asset_id, asset.campaign_id,
+            getattr(self.llm_client, 'model', '?') if self.llm_client else '?',
+        )
 
         logger.info(
             "clip_selection.start asset=%s campaign_id=%d",
@@ -192,6 +197,10 @@ class ClipSelectionAgent:
         db.refresh(asset)
 
         # Log structured summary for debugging + audit
+        logger.info(
+            "clip_selection.done asset=%s generated=%d valid=%d persisted=%d model=%s",
+            asset_id, len(proposals), len(valid), len(created), model_id or "?",
+        )
         logger.info(
             "clip_selection.done asset=%s generated=%d valid=%d persisted=%d model=%s",
             asset_id, len(proposals), len(valid), len(created), model_id or "?",

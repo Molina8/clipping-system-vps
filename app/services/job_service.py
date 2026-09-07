@@ -1,4 +1,5 @@
 """Job service: state transitions, atomic claim, retry logic, lease recovery."""
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
@@ -24,6 +25,17 @@ VALID_TRANSITIONS: dict[JobStatus, set[JobStatus]] = {
 
 class InvalidTransition(Exception):
     pass
+
+
+logger = logging.getLogger(__name__)
+
+
+# State transition dispatch is imported lazily inside complete_job()
+# and fail_job() to avoid the circular import:
+#   job_service -> job_state_transitions -> job_service (create_job)
+# Wired 2026-09-07 to fix Bug #2 (VPS, not Worker): the Worker reports
+# success but the next step in the pipeline (transcribe/render/qa)
+# was never created.
 
 
 class JobNotFound(Exception):
@@ -63,6 +75,7 @@ def create_job(
     db.add(job)
     db.commit()
     db.refresh(job)
+
     return job
 
 
@@ -176,6 +189,31 @@ def complete_job(db: Session, job_id: UUID, *, worker_id: str, result: dict) -> 
     job.lease_until = None
     db.commit()
     db.refresh(job)
+
+    # Fire the state transition handler for this job_type. Lazy import
+    # to avoid circular dep with job_state_transitions. Failures here
+    # MUST NOT roll back the completion — log and move on.
+    try:
+        from app.services.job_state_transitions import (
+            on_download_completed,
+            on_qa_completed,
+            on_render_completed,
+            on_transcribe_completed,
+        )
+        handlers = {
+            "download": on_download_completed,
+            "transcribe": on_transcribe_completed,
+            "render": on_render_completed,
+            "qa": on_qa_completed,
+        }
+        handler = handlers.get(job.job_type)
+        if handler:
+            handler(db, job, result or {})
+    except Exception as e:  # noqa: BLE001
+        logger.exception(
+            "state transition %s failed for job %s: %s",
+            job.job_type, job.id, e,
+        )
     return job
 
 
@@ -210,6 +248,15 @@ def fail_job(db: Session, job_id: UUID, *, worker_id: str, error_message: str) -
 
     db.commit()
     db.refresh(job)
+
+    # Only invoke on_job_failed for terminal failures (after retries exhausted)
+    if job.status == JobStatus.FAILED.value:
+        try:
+            on_job_failed(db, job)
+        except Exception as e:  # noqa: BLE001
+            logger.exception(
+                "on_job_failed handler failed for job %s: %s", job.id, e,
+            )
     return job
 
 

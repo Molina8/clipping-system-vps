@@ -231,8 +231,12 @@ def worker_fail_endpoint(
     db: Session = Depends(get_db),
 ):
     try:
+        # Truncate error_message to schema max (2048) so the Worker can
+        # always report failures. Without this, a long subprocess error
+        # output causes 422 and leaves the job stuck in 'processing'.
+        msg = (payload.error_message or "")[:2048]
         job = job_service.fail_job(
-            db, job_id, worker_id=worker_id, error_message=payload.error_message
+            db, job_id, worker_id=worker_id, error_message=msg
         )
     except job_service.JobNotFound:
         raise HTTPException(status_code=404, detail="job not found")

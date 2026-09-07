@@ -105,7 +105,7 @@ def on_download_completed(
         transcribe_payload = {
             "asset_id": str(asset.id),
             "source_url": asset.source_url,
-            "video": asset.source_url,
+            "video": asset.local_path or asset.source_url,
             "language": (asset.extra_metadata or {}).get("language"),
         }
         create_job(

@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     environment: str = "production"
     log_level: str = "INFO"
 
+    # LLM API (for HttpLLMClient) — MiniMax portal, Anthropic-compatible endpoint
+    anthropic_api_key: str = ""
+    anthropic_base_url: str = "https://api.minimax.io/anthropic"
+    anthropic_model: str = "minimax-m3"
+    anthropic_version: str = "2023-06-01"
+
     @property
     def database_url(self) -> str:
         return (

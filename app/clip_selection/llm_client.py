@@ -108,24 +108,86 @@ class MockLLMClient(LLMClient):
 
 
 class HttpLLMClient(LLMClient):
-    """Real LLM client. Skeleton — wire up when API keys are in `.env`.
+    """Real LLM client backed by Anthropic Claude Messages API.
 
-    TODO when credentials are available:
-      - Choose provider (openai-compatible, anthropic, minimax-portal).
-      - Implement `complete` with the proper HTTP call.
-      - Add rate-limit / retry logic.
+    Uses settings.anthropic_* (loaded from .env by pydantic-settings).
+    Lazy-imports `requests` only when actually called so tests that
+    only use MockLLMClient don't pay the import cost.
+
+    Anthropic Messages API:
+      POST {base_url}/v1/messages
+      Headers:
+        x-api-key: <anthropic_api_key>
+        anthropic-version: <anthropic_version>
+        content-type: application/json
+      Body:
+        { "model": "...", "max_tokens": N, "system": "...", "messages": [{"role":"user","content":"..."}] }
+      Response:
+        { "content": [{"type":"text","text":"..."}], "model": "...", ... }
     """
 
     def __init__(self, provider_url: str, model: str, api_key: str):
-        self.provider_url = provider_url
+        self.provider_url = provider_url.rstrip("/")
         self.model = model
         self.api_key = api_key
 
     def complete(
         self, system_prompt: str, user_prompt: str
     ) -> Tuple[str, Optional[str]]:
-        raise NotImplementedError(
-            "HttpLLMClient is a skeleton. Configure the provider (openai / "
-            "anthropic / minimax-portal) in app/clip_selection/llm_client.py "
-            "and implement the actual HTTP call here."
+        if not self.api_key:
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY not configured in .env — cannot call LLM"
+            )
+        # Lazy import (test runs don't need requests)
+        import requests as _requests  # type: ignore
+        url = f"{self.provider_url}/v1/messages"
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        body = {
+            "model": self.model,
+            "max_tokens": 4096,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+        }
+        # Sanitize logs: never log the request body or api_key
+        try:
+            resp = _requests.post(
+                url, headers=headers, json=body, timeout=60
+            )
+        except _requests.RequestException as exc:
+            raise RuntimeError(f"anthropic http error: {exc}") from exc
+        if resp.status_code >= 400:
+            # Show status + body[:200] but never headers (api_key)
+            raise RuntimeError(
+                f"anthropic {resp.status_code}: {resp.text[:200]}"
+            )
+        data = resp.json()
+        # Extract text from the first content block
+        text = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                text = block.get("text", "")
+                break
+        model_id = data.get("model")
+        return text, model_id
+
+
+def build_http_llm_client() -> "HttpLLMClient":
+    """Factory that wires HttpLLMClient from settings (.env).
+
+    Returns a configured client. Raises if ANTHROPIC_API_KEY is missing.
+    """
+    from app.config import settings
+    if not settings.anthropic_api_key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY missing in /opt/clipping-system/.env — "
+            "cannot build HttpLLMClient"
         )
+    return HttpLLMClient(
+        provider_url=settings.anthropic_base_url,
+        model=settings.anthropic_model,
+        api_key=settings.anthropic_api_key,
+    )

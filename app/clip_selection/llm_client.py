@@ -152,18 +152,42 @@ class HttpLLMClient(LLMClient):
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
         }
-        # Sanitize logs: never log the request body or api_key
-        try:
-            resp = _requests.post(
-                url, headers=headers, json=body, timeout=60
+        # Retry with exponential backoff on transient failures (timeouts, 5xx).
+        last_exc = None
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = _requests.post(
+                    url, headers=headers, json=body, timeout=60
+                )
+            except _requests.RequestException as exc:
+                last_exc = RuntimeError(
+                    f"attempt {attempt}/{max_attempts} anthropic http error: {exc}"
+                )
+                logger.warning("LLM request attempt %d failed: %s", attempt, exc)
+                if attempt < max_attempts:
+                    import time as _time
+                    _time.sleep(2 ** attempt)  # 2s, 4s
+                    continue
+                raise last_exc from exc
+            # 2xx → done
+            if 200 <= resp.status_code < 300:
+                break
+            # 4xx (non-retriable) → fail immediately
+            if 400 <= resp.status_code < 500:
+                raise RuntimeError(
+                    f"anthropic {resp.status_code} (client error, not retried): {resp.text[:200]}"
+                )
+            # 5xx → retriable
+            last_exc = RuntimeError(
+                f"attempt {attempt}/{max_attempts} anthropic {resp.status_code}: {resp.text[:200]}"
             )
-        except _requests.RequestException as exc:
-            raise RuntimeError(f"anthropic http error: {exc}") from exc
-        if resp.status_code >= 400:
-            # Show status + body[:200] but never headers (api_key)
-            raise RuntimeError(
-                f"anthropic {resp.status_code}: {resp.text[:200]}"
-            )
+            logger.warning("LLM %d on attempt %d", resp.status_code, attempt)
+            if attempt < max_attempts:
+                import time as _time
+                _time.sleep(2 ** attempt)
+                continue
+            raise last_exc
         data = resp.json()
         # Extract text from the first content block
         text = ""

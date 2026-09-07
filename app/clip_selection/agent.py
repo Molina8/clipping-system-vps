@@ -90,6 +90,11 @@ class ClipSelectionAgent:
                 f"(current status: {asset.status})"
             )
 
+        logger.info(
+            "clip_selection.start asset=%s campaign_id=%d",
+            asset_id, asset.campaign_id,
+        )
+
         campaign = db.get(Campaign, asset.campaign_id)
         if campaign is None:
             raise ValueError(
@@ -186,6 +191,11 @@ class ClipSelectionAgent:
         db.commit()
         db.refresh(asset)
 
+        # Log structured summary for debugging + audit
+        logger.info(
+            "clip_selection.done asset=%s generated=%d valid=%d persisted=%d model=%s",
+            asset_id, len(proposals), len(valid), len(created), model_id or "?",
+        )
         return {
             "asset_id": str(asset_id),
             "generated": len(proposals),

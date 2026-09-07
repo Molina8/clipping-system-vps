@@ -65,9 +65,9 @@ def maybe_auto_approve(db, candidates, threshold):
             try:
                 approve_candidate(db, cand.id, approve=True)
                 approved += 1
-                logger.info("auto-approved candidate %s (score=%.2f)", cand.id, score)
+                logger.info("auto-approved candidate %s (score=%.2f)", cand.get("id", "?"), score)
             except Exception as exc:
-                logger.warning("auto-approve failed for %s: %s", cand.id, exc)
+                logger.warning("auto-approve failed for %s: %s", cand.get("id", "?"), exc)
     db.commit()
     return approved
 

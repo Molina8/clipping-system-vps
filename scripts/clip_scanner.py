@@ -83,6 +83,8 @@ def main():
     )
     parser.add_argument("--limit", type=int, default=10,
                         help="max assets to process per run (default 10)")
+    parser.add_argument("--top-n", type=int, default=5, dest="top_n",
+                        help="max candidates per asset to persist, ranked by score (default 5)")
     args = parser.parse_args()
 
     try:
@@ -116,7 +118,7 @@ def main():
             logger.info("Processing asset %s (campaign_id=%d)...", asset_id, asset.campaign_id)
             t0 = time.time()
             try:
-                summary = agent.run(db, asset_id)
+                summary = agent.run(db, asset_id, top_n=args.top_n)
             except Exception as exc:
                 logger.exception("agent.run raised for %s: %s", asset_id, exc)
                 continue

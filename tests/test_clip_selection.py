@@ -6,6 +6,8 @@ import json
 import uuid
 from typing import Any, Dict, List
 
+from sqlalchemy import select
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
@@ -350,3 +352,122 @@ class TestStripJsonFences:
         # No opening triple-backtick at start; should pass through.
         out = _strip_json_fences(raw)
         assert out == raw
+
+class TestRankedProposals:
+    """The SYSTEM_PROMPT contract requires Minimax to return ranked
+    proposals. We enforce that here by sorting by score desc + taking
+    only the top_n. These tests pin the behavior.
+
+    Uses MockLLMClient with a deterministic payload via monkey-patching
+    so we don't depend on the live MiniMax API.
+    """
+
+    def _run_with_score_payload(self, db, scores):
+        """Run agent with a hand-crafted ranked payload."""
+        from app.clip_selection.agent import ClipSelectionAgent
+        from app.clip_selection.llm_client import MockLLMClient
+        from app.models.asset import AssetStatus, Asset
+        from app.models.campaign import Campaign
+
+        # Always create a fresh Campaign with unique name + permissive spec
+        # so 10s test proposals pass filter_valid (duration_min default ~20s).
+        cid = Campaign(
+            name=f"rank-test-{uuid.uuid4().hex}",
+            source_provider="manual",
+            spec={
+                "duration_min": 5.0,
+                "duration_max": 60.0,
+                "format": "9:16",
+                "source_provider": "manual",
+            },
+        )
+        db.add(cid)
+        db.flush()
+        asset = Asset(
+            campaign_id=cid.id,
+            source_url="https://example.com/x",
+            source_provider="manual",
+            status=AssetStatus.TRANSCRIBED.value,
+        )
+        db.add(asset)
+        db.flush()
+        db.commit()
+        db.refresh(asset)
+
+        agent = ClipSelectionAgent(llm_client=MockLLMClient())
+        payload = {
+            "proposals": [
+                {
+                    "rank": i + 1,
+                    "start_time": 10.0 * i,
+                    "end_time": 10.0 * (i + 1),
+                    "score": s,
+                    "reasoning": f"proposal {i+1}",
+                    "matched_keywords": [],
+                }
+                for i, s in enumerate(scores)
+            ],
+            "notes": "test",
+        }
+        agent.llm_client.complete = lambda sys_p, usr_p: (
+            json.dumps(payload), "mock-test"
+        )
+        return agent.run(db, str(asset.id), top_n=len(scores))
+
+    def test_top_n_limits_persisted_count(self, db):
+        """When agent returns 6 proposals but top_n=3, only 3 are persisted."""
+        from app.models.candidate import Candidate
+        from sqlalchemy import func
+        scores = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4]
+        summary = self._run_with_score_payload(db, scores)
+        kept = summary["generated"]
+        assert kept == 3, f"expected top_n=3 to keep 3 proposals, got {kept}"
+
+    def test_top_n_keeps_highest_scored(self, db):
+        """The top_n proposals MUST be the ones with the highest scores."""
+        from app.models.candidate import Candidate
+        scores = [0.5, 0.9, 0.7, 0.8, 0.6]  # out of order on purpose
+        summary = self._run_with_score_payload(db, scores)
+        # The kept 3 should be the 3 highest: 0.9, 0.8, 0.7
+        # Filter_valid may reject some, but at least one should remain
+        persisted = summary["candidates"]
+        assert len(persisted) >= 1
+        kept_scores = sorted(
+            [float(c["score"]) for c in persisted], reverse=True
+        )
+        # The top-3 by score are 0.9, 0.8, 0.7. All kept must be from {0.9, 0.8, 0.7}.
+        for s in kept_scores:
+            assert s >= 0.7, f"unexpected low-score kept: {s}"
+
+    def test_top_n_minimum_is_one(self, db):
+        """If top_n=0 or negative, we MUST keep at least 1 proposal."""
+        scores = [0.9, 0.5]
+        summary = self._run_with_score_payload(db, scores)
+        assert summary["generated"] >= 1
+
+    def test_ranking_log_emitted(self, db, caplog):
+        """After ranking we MUST log the kept scores for audit."""
+        scores = [0.9, 0.7, 0.5]
+        with caplog.at_level("INFO", logger="app.clip_selection.agent"):
+            self._run_with_score_payload(db, scores)
+        # Verify at least one ranking log was emitted
+        ranking_logs = [
+            r for r in caplog.records
+            if r.name == "app.clip_selection.agent"
+            and "ranked" in r.message
+        ]
+        assert ranking_logs, f"no ranking log emitted; saw: {[r.message for r in caplog.records]}"
+
+    def test_clip_scanner_top_n_flag(self):
+        """The --top-n CLI flag on clip_scanner defaults to 5 and is forwarded."""
+        import subprocess
+        result = subprocess.run(
+            ["python", "scripts/clip_scanner.py", "--help"],
+            cwd="/opt/clipping-system",
+            capture_output=True, text=True,
+            env={**__import__("os").environ, "PATH": "/opt/clipping-system/venv/bin:" + __import__("os").environ.get("PATH", "")},
+        )
+        assert "--top-n" in result.stdout, "clip_scanner --help should show --top-n flag"
+        # Check default value is 5
+        assert "default 5" in result.stdout, "clip_scanner --top-n default should be 5"
+

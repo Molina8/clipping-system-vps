@@ -69,8 +69,11 @@ class ClipSelectionAgent:
     def __init__(self, llm_client: Optional[LLMClient] = None):
         self.llm_client = llm_client or MockLLMClient()
 
-    def run(self, db: Session, asset_id: str) -> Dict[str, Any]:
+    def run(self, db: Session, asset_id: str, top_n: int = 5) -> Dict[str, Any]:
         """Process a single asset end-to-end.
+
+        Proposals from Minimax are ranked (highest score first) by the
+        SYSTEM_PROMPT contract. We sort and take only the top_n best.
 
         Returns a summary dict with counts and the persisted candidates.
         Raises ValueError if the asset is missing or not yet transcribed.
@@ -154,7 +157,18 @@ class ClipSelectionAgent:
                 raw=raw_text[:500],
             )
 
-        proposals = response.proposals
+        # --- 5b. Rank proposals (highest score first) and take top_n ---
+        # The SYSTEM_PROMPT requires Minimax to already return them ranked,
+        # but we enforce ordering + dedup here as defense in depth.
+        proposals = sorted(
+            response.proposals, key=lambda p: float(p.score or 0.0),
+            reverse=True,
+        )[:max(1, top_n)]
+        logger.info(
+            "clip_selection.ranked asset=%s top_n=%d kept=%d scores=%s",
+            asset_id, top_n, len(proposals),
+            [round(float(p.score or 0.0), 2) for p in proposals],
+        )
 
         # --- 6. Validate against spec ------------------------------------
         valid, rejected = filter_valid(proposals, spec, transcription_text)

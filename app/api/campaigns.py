@@ -301,6 +301,16 @@ def enqueue_pipeline(
                 "format": "9:16",
                 "watermark_url": None,
                 "captions_required": False,
+                # Worker contract (verified against render.py:27 in completed
+                # jobs from campaign 5463): start_time/end_time are required
+                # and must satisfy end_time > start_time.
+                # If we have a known duration, render a full clip; otherwise
+                # pass start=0, end=0 and let the Worker decide (it'll fail
+                # loud, which is better than a silent zero-length render).
+                "start": 0.0,
+                "end": float(asset.duration_seconds) if asset.duration_seconds else 0.0,
+                "start_time": 0.0,
+                "end_time": float(asset.duration_seconds) if asset.duration_seconds else 0.0,
             },
         ),
     ]:

@@ -207,6 +207,25 @@ class TestEnqueuePipelineContract(unittest.TestCase):
         r = self.client.post("/campaigns/999999999/enqueue", headers=self.headers)
         self.assertEqual(r.status_code, 404, r.text)
 
+    def test_enqueue_includes_backlog_clip_selection_summary(self):
+        """Option A (2026-09-11): enqueue_pipeline runs the backlog drain for
+        transcribed assets without clip_selection. The summary is exposed
+        in the response under `backlog_clip_selection`."""
+        url = "https://youtube.com/watch?v=dQw4w9WgXcQ"
+        cid, _ = _make_ready_campaign(self.client, self.headers, url)
+
+        r = self.client.post(f"/campaigns/{cid}/enqueue", headers=self.headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertIn("backlog_clip_selection", body)
+        self.assertIn("processed", body["backlog_clip_selection"])
+        self.assertIn("skipped", body["backlog_clip_selection"])
+        # processed/skipped are ints >= 0
+        self.assertIsInstance(body["backlog_clip_selection"]["processed"], int)
+        self.assertIsInstance(body["backlog_clip_selection"]["skipped"], int)
+        self.assertGreaterEqual(body["backlog_clip_selection"]["processed"], 0)
+        self.assertGreaterEqual(body["backlog_clip_selection"]["skipped"], 0)
+
 
 def _make_job(sess, job_type, payload):
     from app.models.job import Job

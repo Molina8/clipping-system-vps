@@ -323,6 +323,18 @@ def enqueue_pipeline(
 
     db.commit()
 
+    # Backlog drain (option A, 2026-09-11): if there are transcribed assets
+    # whose ClipSelectionAgent never ran (e.g. because the asset was
+    # transcribed before on_transcribe_completed started chaining, or because
+    # the on_transcribe_completed handler errored mid-flight), enqueueing this
+    # campaign is a natural moment to catch them up.
+    #
+    # We piggy-back on the cron that already drives enqueue_ready; no new
+    # scheduler thread, no new flag.
+    from app.clip_selection.processor import process_pending_clip_selections
+
+    backlog = process_pending_clip_selections(db, limit=10)
+
     return {
         "campaign_id": c.id,
         "asset_id": asset_id,
@@ -330,6 +342,10 @@ def enqueue_pipeline(
         "skipped": skipped,
         "total_created": len(created),
         "total_skipped": len(skipped),
+        "backlog_clip_selection": {
+            "processed": backlog["processed"],
+            "skipped": backlog["skipped"],
+        },
     }
 
 

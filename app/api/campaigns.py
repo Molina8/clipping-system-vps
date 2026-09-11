@@ -51,7 +51,7 @@ router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 import re as _re
 
 _VIDEO_EXTENSIONS = (
-    ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".webp", ".zip",
+    ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".zip",
 )
 
 # Regex patterns that MUST match for a URL to be accepted.

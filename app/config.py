@@ -36,6 +36,14 @@ class Settings(BaseSettings):
     cpm_min_usd_per_1k: float = 0.50
     prize_pool_min_usd: float = 5000.0
 
+    # Mission Control (read-only dashboard)
+    # Default OFF — operator must explicitly enable in .env to mount.
+    mission_control_enabled: bool = False
+    # Optional base URL the frontend prepends to local_path / file_path to
+    # make them clickable (e.g. https://worker.tailnet.ts.net:8443 or file://).
+    # Leave empty to render as literal text.
+    worker_file_base_url: str = ""
+
     @property
     def database_url(self) -> str:
         return (

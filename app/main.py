@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.jobs import router as jobs_router
+from app.api.mission_control import router as mission_control_router
 from app.api.system import router as system_router
 from app.config import settings
 from app.db.database import check_database_connection
@@ -159,6 +160,28 @@ from app.api.clip_selection import router as clip_selection_router  # noqa: E402
 app.include_router(clip_selection_router)
 from app.api.discovery import router as discovery_router  # noqa: E402
 app.include_router(discovery_router)
+
+# Optional read-only dashboard. Disabled by default (404 from the gate inside
+# each endpoint). The router is ALWAYS mounted so tests can flip the flag
+# without re-importing the app. StaticFiles mount also gated at import time.
+app.include_router(mission_control_router)
+import pathlib as _pathlib
+_mc_dir = _pathlib.Path(__file__).parent / "static" / "mission-control"
+if _mc_dir.is_dir():
+    from fastapi.staticfiles import StaticFiles
+    app.mount(
+        "/mission-control",
+        StaticFiles(directory=str(_mc_dir), html=True),
+        name="mission-control-static",
+    )
+if settings.mission_control_enabled:
+    logger.info("Mission Control enabled at /mission-control")
+else:
+    logger.info(
+        "Mission Control disabled (MISSION_CONTROL_ENABLED=false); "
+        "endpoints return 404 and static files are still served but auth-protected"
+    )
+
 from app.models import candidate, clip  # noqa: E402,F401  # alembic model registration
 from app.models import asset  # noqa: E402,F401  # model registration for alembic
 from app.models import campaign  # noqa: E402,F401  # model registration for alembic

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Clipping — Mission Control</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">🎬</span>
+    <span class="title">Clipping · Mission Control</span>
+    <span class="badge badge-readonly" title="This panel never writes to the database">READ-ONLY</span>
+  </div>
+  <div class="auth-bar">
+    <input type="password" id="token" placeholder="Bearer token" autocomplete="off">
+    <button id="save-token">Save</button>
+    <span id="auth-status" class="auth-status">no token</span>
+    <span id="base-url-status" class="auth-status" title="worker_file_base_url from /overview"></span>
+  </div>
+</header>
+
+<div class="layout">
+  <nav class="sidebar">
+    <a href="#/overview" data-route="overview">Overview</a>
+    <a href="#/campaigns" data-route="campaigns">Campaigns</a>
+    <a href="#/jobs" data-route="jobs">Jobs</a>
+    <a href="#/videos" data-route="videos">Videos</a>
+    <a href="#/clips" data-route="clips">Clips</a>
+    <div class="sidebar-footer">
+      <a href="/openapi.json" target="_blank">OpenAPI</a>
+      <a href="/health" target="_blank">/health</a>
+    </div>
+  </nav>
+  <main id="main">
+    <div class="empty">Pick a section on the left.</div>
+  </main>
+</div>
+
+<div id="modal" class="modal hidden" role="dialog" aria-modal="true">
+  <div class="modal-backdrop"></div>
+  <div class="modal-content">
+    <button class="modal-close" aria-label="Close">×</button>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<footer class="footer">
+  <span>Auto-refresh: <span id="auto-refresh-status">off</span></span>
+  <span id="last-update"></span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

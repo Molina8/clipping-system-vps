@@ -31,6 +31,40 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 
 
+# --- Asset URL filter --------------------------------------------------------
+# Only enqueue pipeline jobs for assets that the Worker can actually process.
+# Whop CDN banners/icons are stored in the DB as 'external' kind but are NOT
+# videos — FFmpeg would reject them. YouTube watch URLs, TikTok, Instagram,
+# Drive, Dropbox, Mega, and direct media URLs (.mp4/.mov/.webm/.zip) are valid.
+
+_VIDEO_EXTENSIONS = (
+    ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".webp", ".zip",
+)
+_REAL_VIDEO_HOSTS = (
+    "youtube.com", "youtu.be",
+    "tiktok.com",
+    "instagram.com",
+    "drive.google.com", "docs.google.com",
+    "dropbox.com", "mega.nz",
+    "vimeo.com",
+)
+
+
+def _is_real_video_url(url: str | None) -> bool:
+    """Return True iff the URL points at a processable video.
+
+    Conservative: when in doubt, returns False (caller should NOT enqueue).
+    """
+    if not url:
+        return False
+    u = url.lower()
+    if any(u.endswith(ext) or f"{ext}?" in u for ext in _VIDEO_EXTENSIONS):
+        return True
+    if any(host in u for host in _REAL_VIDEO_HOSTS):
+        return True
+    return False
+
+
 @router.post("", response_model=CampaignOut, status_code=201)
 @router.post("/", response_model=CampaignOut, status_code=201)
 def create(
@@ -153,44 +187,96 @@ def enqueue_pipeline(
             detail=f"Campaign is in status='{c.status}', expected 'ready'",
         )
 
-    # Pick the first asset for this campaign (video preferred).
-    asset = (
+    # Pick the first PROCESSABLE asset for this campaign.
+    # We must iterate because the first asset by created_at is usually a
+    # banner/icon from whop CDN — useless for the Worker. We pick the
+    # earliest asset whose URL is a real video / external media.
+    from sqlalchemy import or_
+
+    candidates = (
         db.query(Asset)
         .filter(Asset.campaign_id == campaign_id)
         .filter(Asset.asset_type == "video")
         .order_by(Asset.created_at.asc())
-        .first()
+        .all()
     )
+    asset = next((a for a in candidates if _is_real_video_url(a.source_url)), None)
     if asset is None:
-        asset = (
+        # Fallback: any asset_type, first processable URL
+        candidates = (
             db.query(Asset)
             .filter(Asset.campaign_id == campaign_id)
             .order_by(Asset.created_at.asc())
-            .first()
+            .all()
         )
+        asset = next((a for a in candidates if _is_real_video_url(a.source_url)), None)
     if asset is None:
         raise HTTPException(
             status_code=409,
-            detail="Campaign has no assets — cannot enqueue pipeline",
+            detail="Campaign has no processable assets — cannot enqueue pipeline",
         )
 
     asset_id = str(asset.id)
 
+    # Filter: only enqueue if the asset is a processable video URL.
+    # Banners / icons from whop CDN are stored in BD but not enqueued —
+    # the Worker would just FFmpeg-fail on them.
+    if not _is_real_video_url(asset.source_url):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Asset {asset_id} is not a processable video URL "
+                f"(host={asset.source_url[:80]}...) — not enqueueing."
+            ),
+        )
+
     created = []
     skipped = []
 
+    # Worker contract (verified against clipping-windows-worker payload
+    # schemas from real completed jobs, 2026-09-11):
+    #   download.py   line 33 → "payload.url is required"
+    #   transcribe.py line 28 → "payload.video_path or payload.video is required"
+    #   render.py     line 25 → "payload.input_video is required"
+    #
+    # We send BOTH legacy (source_url) and Worker-expected (url / video_path /
+    # video / input_video) keys so the Worker never sees a missing field.
     for job_type, payload in [
         (
             "download",
-            {"campaign_id": str(c.id), "asset_id": asset_id, "source_url": asset.source_url},
+            {
+                "campaign_id": str(c.id),
+                "asset_id": asset_id,
+                "url": asset.source_url,                # Worker contract
+                "source_url": asset.source_url,         # backwards-compat
+                "destination": f"/tmp/cs_{c.id}_video.mp4",
+            },
         ),
         (
             "transcribe",
-            {"campaign_id": str(c.id), "asset_id": asset_id},
+            {
+                "campaign_id": str(c.id),
+                "asset_id": asset_id,
+                "video_path": asset.source_url,         # Worker contract
+                "video": asset.source_url,              # Worker contract (alt)
+                "url": asset.source_url,                # backwards-compat
+                "source_url": asset.source_url,         # backwards-compat
+                "language": "en",
+            },
         ),
         (
             "render",
-            {"campaign_id": str(c.id), "asset_id": asset_id},
+            {
+                "campaign_id": str(c.id),
+                "asset_id": asset_id,
+                "input_video": asset.source_url,        # Worker contract
+                "video_path": asset.source_url,         # backwards-compat
+                "url": asset.source_url,                # backwards-compat
+                "source_url": asset.source_url,         # backwards-compat
+                "format": "9:16",
+                "watermark_url": None,
+                "captions_required": False,
+            },
         ),
     ]:
         # Idempotency: don't create a new pending job if one is open.

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 scripts/clip_scanner.py
 =======================
@@ -25,6 +26,7 @@ import json
 import logging
 import sys
 import time
+import uuid
 from pathlib import Path
 
 ROOT = Path("/opt/clipping-system")
@@ -62,12 +64,14 @@ def maybe_auto_approve(db, candidates, threshold):
     for cand in candidates:
         score = float((cand or {}).get("score") or 0.0)
         if score >= threshold:
+            cand_id = cand.get("id")
             try:
-                approve_candidate(db, cand.id, approve=True)
+                # FIX: convert str UUID -> uuid.UUID; remove invalid 'approve=True' kwarg
+                approve_candidate(db, uuid.UUID(cand_id))
                 approved += 1
-                logger.info("auto-approved candidate %s (score=%.2f)", cand.get("id", "?"), score)
+                logger.info("auto-approved candidate %s (score=%.2f)", cand_id, score)
             except Exception as exc:
-                logger.warning("auto-approve failed for %s: %s", cand.get("id", "?"), exc)
+                logger.warning("auto-approve failed for %s: %s", cand_id, exc)
     db.commit()
     return approved
 

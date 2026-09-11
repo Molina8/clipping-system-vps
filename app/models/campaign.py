@@ -31,6 +31,7 @@ class CampaignSource(str, enum.Enum):
     REDDIT = "reddit"
     TWITCH = "twitch"
     MANUAL = "manual"   # created via API by user
+    WHOP = "whop"       # discovered from Whop tenant sub-app
     OTHER = "other"
 
 

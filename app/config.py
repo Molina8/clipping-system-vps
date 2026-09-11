@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     anthropic_model: str = "minimax-m3"
     anthropic_version: str = "2023-06-01"
 
+    # Discovery scoring thresholds (low-bar by default — tune up later)
+    cpm_min_usd_per_1k: float = 0.50
+    prize_pool_min_usd: float = 5000.0
+
     @property
     def database_url(self) -> str:
         return (

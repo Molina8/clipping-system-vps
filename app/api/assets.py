@@ -25,6 +25,8 @@ from app.services.asset_service import (
     update_asset,
 )
 
+from app.clip_selection.agent import ClipSelectionAgent
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/assets", tags=["assets"])
@@ -118,3 +120,40 @@ def update(
     if a is None:
         raise HTTPException(status_code=404, detail="Asset not found")
     return a
+
+
+@router.post("/backfill_clip_selection")
+def backfill_clip_selection(
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_bearer),
+):
+    """Backfill: run clip_selection for all assets in 'transcribed' status
+    that have no candidates yet. Fix for the asset->candidate bottleneck."""
+    from app.models.asset import Asset, AssetStatus
+    from app.models.candidate import Candidate
+    from sqlalchemy import select
+
+    assets_q = select(Asset).where(Asset.status == AssetStatus.TRANSCRIBED.value)
+    assets = db.execute(assets_q).scalars().all()
+
+    results = []
+    agent = ClipSelectionAgent()
+    for asset in assets:
+        existing = db.execute(
+            select(Candidate).where(Candidate.asset_id == asset.id)
+        ).scalars().first()
+        if existing:
+            results.append({"asset_id": str(asset.id), "skipped": True, "reason": "already_has_candidates"})
+            continue
+        try:
+            result = agent.run(db, asset_id=str(asset.id))
+            results.append({
+                "asset_id": str(asset.id),
+                "generated": result.get("generated", 0),
+                "valid": result.get("valid", 0),
+                "persisted": result.get("persisted", 0),
+            })
+        except Exception as e:
+            results.append({"asset_id": str(asset.id), "error": str(e)})
+
+    return {"processed": len(assets), "results": results}

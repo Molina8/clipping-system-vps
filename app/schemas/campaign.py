@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 # Source providers we currently support
 ALLOWED_SOURCES = {
     "twitter", "youtube", "instagram", "tiktok",
-    "reddit", "twitch", "manual", "other",
+    "reddit", "twitch", "manual", "whop", "other",
 }
 
 
@@ -30,6 +30,13 @@ class CampaignSpec(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     exclude_keywords: list[str] = Field(default_factory=list)
     # Future-proofing for richer specs (campaign-specific rules, asset filters, etc.)
+    # Documented keys:
+    #   - "qa_rules": dict con reglas técnicas que el QA Worker (FFprobe) aplica:
+    #       { "width": int, "height": int, "min_fps": float,
+    #         "require_audio": bool, "codec": str }
+    #     (poblado por app.campaign_engine.normalizer / campaign_analyzer).
+    #   - "qa_rules_source": "local" | "llm"  (trazabilidad del origen).
+    #   - "notes": list[str]  (notas del parser si quedaron huecos).
     extra: dict[str, Any] = Field(default_factory=dict)
 
 

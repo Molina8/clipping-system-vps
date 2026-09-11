@@ -154,6 +154,15 @@ def on_transcribe_completed(
     db.refresh(asset)
     logger.info("transcription stored for asset %s", asset.id)
 
+    # --- Auto clip_selection (fix cuello de botella asset->candidate) ---
+    try:
+        from app.clip_selection.agent import ClipSelectionAgent
+        agent = ClipSelectionAgent()
+        result = agent.run(db, asset_id=str(asset.id))
+        logger.info("clip_selection auto-run asset %s: %s", asset.id, result)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("clip_selection auto-run failed asset %s: %s", asset.id, e)
+
 
 def on_render_completed(
     db: Session, job: Job, result_data: dict
@@ -210,11 +219,51 @@ def on_render_completed(
     # Auto-create QA job
     qa_job: Optional[Job] = None
     try:
-        qa_payload = {
+        # Build QA rules from campaign.spec (Step 3 architecture_flow.md):
+        #   - Technical rules (width/height/min_fps/require_audio/codec) live in
+        #     spec.extra["qa_rules"] (OpenClaw/MiniMax populated when generating the spec).
+        #   - Duration window (spec.duration_min/max) is fused into rules.min_duration/
+        #     max_duration so the QA Worker enforces the same window the campaign wants
+        #     semantically. No redundant fields.
+        qa_rules: dict[str, Any] = {}
+        try:
+            from app.models.campaign import Campaign
+            campaign = db.get(Campaign, asset.campaign_id)
+            if campaign is not None and isinstance(campaign.spec, dict):
+                spec = campaign.spec
+                # Duration window fused from CampaignSpec
+                if spec.get("duration_min") is not None:
+                    qa_rules["min_duration"] = float(spec["duration_min"])
+                if spec.get("duration_max") is not None:
+                    qa_rules["max_duration"] = float(spec["duration_max"])
+                # Technical rules from spec.extra["qa_rules"]
+                extra = spec.get("extra") or {}
+                if isinstance(extra, dict):
+                    extra_qa = extra.get("qa_rules") or {}
+                    if isinstance(extra_qa, dict):
+                        for key in (
+                            "width",
+                            "height",
+                            "min_fps",
+                            "require_audio",
+                            "codec",
+                        ):
+                            if key in extra_qa:
+                                qa_rules[key] = extra_qa[key]
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "could not load QA rules from campaign %s: %s",
+                getattr(asset, "campaign_id", None),
+                e,
+            )
+
+        qa_payload: dict[str, Any] = {
             "clip_id": str(clip.id),
             "asset_id": str(asset.id),
             "file_path": clip.file_path,
         }
+        if qa_rules:
+            qa_payload["rules"] = qa_rules
         qa_job = create_job(
             db,
             job_type="qa",

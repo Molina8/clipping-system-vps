@@ -14,12 +14,17 @@ from app.schemas.campaign import (
     CampaignOut,
     CampaignUpdate,
 )
+from app.services.campaign_analyzer import (
+    analyze_campaign,
+    analyze_due_campaigns,
+)
 from app.services.campaign_service import (
     create_campaign,
     get_campaign,
     list_campaigns,
     update_campaign,
 )
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -85,3 +90,176 @@ def update(
     if c is None:
         raise HTTPException(status_code=404, detail="Campaign not found")
     return c
+
+
+
+# --- Steps 2 + 3 of architecture_flow.md: analyze a campaign ---------------
+
+@router.post("/analyze_due", response_model=dict)
+def analyze_due(
+    limit: int = Query(20, ge=1, le=200),
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_bearer),
+):
+    """Analyze every draft campaign with source_instructions.
+
+    Useful for manual triggering and smoke-testing. The cron loop inside
+    main.py calls this same function on a timer.
+    """
+    results = analyze_due_campaigns(db, settings=settings, limit=limit)
+    return {"analyzed": len(results), "results": results}
+
+
+@router.post("/{campaign_id}/analyze", response_model=dict)
+def analyze_one(
+    campaign_id: int,
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_bearer),
+):
+    """Analyze one campaign by id (idempotent: overwrites spec)."""
+    c = get_campaign(db, campaign_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return analyze_campaign(db, c, settings=settings)
+
+
+# --- Step 7 of architecture_flow.md: enqueue pipeline jobs ---------------
+
+@router.post("/{campaign_id}/enqueue", response_model=dict)
+def enqueue_pipeline(
+    campaign_id: int,
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_bearer),
+):
+    """Enqueue the download + transcribe + render pipeline for a campaign.
+
+    Idempotent: existing pending/processing jobs of the same type for the
+    same campaign are left untouched. Returns the count of jobs created.
+
+    The campaign must be in status='ready' (analyzed with qa_rules). The
+    first asset of the campaign becomes the source for the pipeline.
+    """
+    import uuid as _uuid
+    from app.models.job import Job
+    from app.models.campaign import Campaign
+    from app.models.asset import Asset
+
+    c = db.get(Campaign, campaign_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if c.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Campaign is in status='{c.status}', expected 'ready'",
+        )
+
+    # Pick the first asset for this campaign (video preferred).
+    asset = (
+        db.query(Asset)
+        .filter(Asset.campaign_id == campaign_id)
+        .filter(Asset.asset_type == "video")
+        .order_by(Asset.created_at.asc())
+        .first()
+    )
+    if asset is None:
+        asset = (
+            db.query(Asset)
+            .filter(Asset.campaign_id == campaign_id)
+            .order_by(Asset.created_at.asc())
+            .first()
+        )
+    if asset is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Campaign has no assets — cannot enqueue pipeline",
+        )
+
+    asset_id = str(asset.id)
+
+    created = []
+    skipped = []
+
+    for job_type, payload in [
+        (
+            "download",
+            {"campaign_id": str(c.id), "asset_id": asset_id, "source_url": asset.source_url},
+        ),
+        (
+            "transcribe",
+            {"campaign_id": str(c.id), "asset_id": asset_id},
+        ),
+        (
+            "render",
+            {"campaign_id": str(c.id), "asset_id": asset_id},
+        ),
+    ]:
+        # Idempotency: don't create a new pending job if one is open.
+        existing = (
+            db.query(Job)
+            .filter(Job.job_type == job_type)
+            .filter(Job.payload["campaign_id"].astext == str(c.id))
+            .filter(Job.status.in_(("pending", "processing", "assigned")))
+            .first()
+        )
+        if existing is not None:
+            skipped.append({"job_type": job_type, "existing_job_id": str(existing.id)})
+            continue
+
+        job = Job(
+            id=_uuid.uuid4(),
+            job_type=job_type,
+            status="pending",
+            priority=5,
+            payload=payload,
+            max_attempts=3,
+        )
+        db.add(job)
+        created.append({"job_type": job_type, "job_id": str(job.id)})
+
+    db.commit()
+
+    return {
+        "campaign_id": c.id,
+        "asset_id": asset_id,
+        "created": created,
+        "skipped": skipped,
+        "total_created": len(created),
+        "total_skipped": len(skipped),
+    }
+
+
+@router.post("/enqueue_ready", response_model=dict)
+def enqueue_all_ready(
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_bearer),
+):
+    """Backlog drain: enqueue pipeline for every 'ready' campaign without open jobs.
+
+    Called by the analyze cron loop (main.py) every 10 minutes.
+    """
+    from app.models.campaign import Campaign
+
+    ready = (
+        db.query(Campaign)
+        .filter(Campaign.status == "ready")
+        .filter(Campaign.source_provider != "manual")  # don't re-enqueue manual ones
+        .order_by(Campaign.id.asc())
+        .limit(limit)
+        .all()
+    )
+
+    enqueued = 0
+    skipped = 0
+    for c in ready:
+        try:
+            r = enqueue_pipeline(c.id, db=db, _=True)  # bearer already validated
+            if r["total_created"] > 0:
+                enqueued += 1
+            else:
+                skipped += 1
+        except HTTPException as e:
+            logger.warning("enqueue skipped for %s: %s", c.id, e.detail)
+            skipped += 1
+
+    return {"scanned": len(ready), "enqueued": enqueued, "skipped": skipped}

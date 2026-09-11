@@ -19,6 +19,22 @@ from typing import Optional
 from app.campaign_engine.models import CampaignHints, NormalizedSpec
 
 
+# Technical QA rules derived from format/quality. These are the values the
+# QA Worker (Windows) enforces with FFprobe. Stored under spec.extra["qa_rules"]
+# so the VPS-side job_state_transitions can attach them to qa_payload.
+# Defaults favor "vertical short-form" (9:16) which is what most clipping
+# campaigns want.
+_QA_RULES_BY_FORMAT: dict[str, dict] = {
+    "9:16":  {"width": 1080, "height": 1920, "min_fps": 24.0, "require_audio": True, "codec": "h264"},
+    "1:1":   {"width": 1080, "height": 1080, "min_fps": 24.0, "require_audio": True, "codec": "h264"},
+    "16:9":  {"width": 1920, "height": 1080, "min_fps": 24.0, "require_audio": True, "codec": "h264"},
+}
+
+
+def _default_qa_rules(fmt: str) -> dict:
+    return dict(_QA_RULES_BY_FORMAT.get(fmt, _QA_RULES_BY_FORMAT["9:16"]))
+
+
 _PROVIDER_DEFAULTS: dict[str, dict] = {
     "twitter": {
         "format": "16:9",
@@ -101,6 +117,15 @@ def normalize(hints: CampaignHints, source_provider: str) -> NormalizedSpec:
     fmt = hints.format or defaults["format"]
     language = hints.language or defaults["language"]
 
+    # Build qa_rules from format defaults. Hints can override them later
+    # via the LLM step (Step 3 architecture_flow.md) which populates
+    # spec.extra["qa_rules"] with richer per-campaign values.
+    qa_rules = _default_qa_rules(fmt)
+    extra: dict = {}
+    if hints.extra_notes:
+        extra["notes"] = list(hints.extra_notes)
+    extra["qa_rules"] = qa_rules
+
     return NormalizedSpec(
         duration_min=duration_min,
         duration_max=duration_max,
@@ -111,5 +136,5 @@ def normalize(hints: CampaignHints, source_provider: str) -> NormalizedSpec:
         keywords=hints.keywords,
         exclude_keywords=hints.exclude_keywords,
         source_provider=source_provider,
-        extra={"notes": hints.extra_notes} if hints.extra_notes else {},
+        extra=extra,
     )

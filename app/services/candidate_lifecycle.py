@@ -171,6 +171,14 @@ def approve_candidate(
         "campaign_id": int(campaign.id),
         "source_url": asset.source_url,
         "local_path": asset.local_path,
+        # Worker contract: requiere "input_video" (path local en el Worker).
+        # El Worker ya descargó el asset en el paso 8; local_path apunta
+        # a esa misma copia sincronizada por el Asset Resolver.
+        "input_video": asset.local_path,
+        # Worker en esta versión lee payload["start"]/payload["end"];
+        # añadimos alias sin romper start_time/end_time (compatibilidad).
+        "start": float(candidate.start_time),
+        "end": float(candidate.end_time),
         "start_time": float(candidate.start_time),
         "end_time": float(candidate.end_time),
         "format": spec.format,

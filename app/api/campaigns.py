@@ -34,19 +34,39 @@ router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 # --- Asset URL filter --------------------------------------------------------
 # Only enqueue pipeline jobs for assets that the Worker can actually process.
 # Whop CDN banners/icons are stored in the DB as 'external' kind but are NOT
-# videos — FFmpeg would reject them. YouTube watch URLs, TikTok, Instagram,
-# Drive, Dropbox, Mega, and direct media URLs (.mp4/.mov/.webm/.zip) are valid.
+# videos — FFmpeg would reject them.
+#
+# REJECTED patterns (verified against real Worker failures, 2026-09-11):
+#   - Bare profile pages: https://www.youtube.com/@WhopIO
+#   - Bare root profiles: https://www.instagram.com/whop/
+#   - These look like hosts to my host filter but the Worker can't process them.
+#
+# ACCEPTED patterns:
+#   - YouTube:    /watch?v=, /shorts/, youtu.be/<id>
+#   - TikTok:     /@user/video/<id>  (NOT bare /@user)
+#   - Instagram:  /p/<id>, /reel/<id>  (NOT bare /<user>)
+#   - Drive/Dropbox/Mega/Vimeo: any URL on these hosts
+#   - Direct media: .mp4, .mov, .webm, .mkv, .avi, .m4v, .webp, .zip
+
+import re as _re
 
 _VIDEO_EXTENSIONS = (
     ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".webp", ".zip",
 )
-_REAL_VIDEO_HOSTS = (
-    "youtube.com", "youtu.be",
-    "tiktok.com",
-    "instagram.com",
-    "drive.google.com", "docs.google.com",
-    "dropbox.com", "mega.nz",
-    "vimeo.com",
+
+# Regex patterns that MUST match for a URL to be accepted.
+_VIDEO_PATTERNS = (
+    _re.compile(r"youtube\.com/watch\?v=", _re.I),
+    _re.compile(r"youtube\.com/shorts/", _re.I),
+    _re.compile(r"youtu\.be/[A-Za-z0-9_-]+", _re.I),
+    _re.compile(r"tiktok\.com/@[^/]+/video/\d+", _re.I),
+    _re.compile(r"instagram\.com/p/[A-Za-z0-9_-]+", _re.I),
+    _re.compile(r"instagram\.com/reel/[A-Za-z0-9_-]+", _re.I),
+    _re.compile(r"drive\.google\.com/", _re.I),
+    _re.compile(r"docs\.google\.com/", _re.I),
+    _re.compile(r"dropbox\.com/", _re.I),
+    _re.compile(r"mega\.nz/", _re.I),
+    _re.compile(r"vimeo\.com/", _re.I),
 )
 
 
@@ -58,10 +78,15 @@ def _is_real_video_url(url: str | None) -> bool:
     if not url:
         return False
     u = url.lower()
+
+    # Direct media file extension (most reliable signal).
     if any(u.endswith(ext) or f"{ext}?" in u for ext in _VIDEO_EXTENSIONS):
         return True
-    if any(host in u for host in _REAL_VIDEO_HOSTS):
+
+    # Specific video URL pattern (not just "host is known").
+    if any(p.search(u) for p in _VIDEO_PATTERNS):
         return True
+
     return False
 
 

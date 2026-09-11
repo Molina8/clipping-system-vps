@@ -102,10 +102,17 @@ def on_download_completed(
 
     # Auto-create transcribe job
     try:
+        # Worker contract: transcribe requires `video` (or legacy `video_path`).
+        # Usamos `asset.local_path` que acabamos de actualizar desde el result.
+        # Fallback a source_url solo si el Worker no devolvió `file_path` (job
+        # legacy o Worker que aún no soporta el canon) — el Worker fallará
+        # ruidosamente en ese caso, mejor que un silencio.
         transcribe_payload = {
             "asset_id": str(asset.id),
-            "source_url": asset.source_url,
+            "campaign_id": str(asset.campaign_id),
             "video": asset.local_path or asset.source_url,
+            "video_path": asset.local_path or asset.source_url,  # alias
+            "source_url": asset.source_url,                       # backwards-compat
             "language": (asset.extra_metadata or {}).get("language"),
         }
         create_job(

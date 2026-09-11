@@ -190,13 +190,28 @@ def enqueue_pipeline(
     db: Session = Depends(get_db),
     _: bool = Depends(require_bearer),
 ):
-    """Enqueue the download + transcribe + render pipeline for a campaign.
+    """Enqueue the download job for a campaign.
 
-    Idempotent: existing pending/processing jobs of the same type for the
-    same campaign are left untouched. Returns the count of jobs created.
+    IMPORTANT (2026-09-11 race-fix):
+      Previously this endpoint enqueued download + transcribe + render in a
+      single atomic batch, sending source_url as the input path for both
+      transcribe and render. That caused the Worker to try to read a remote
+      URL it had not downloaded yet, producing hard failures.
+
+      Correct flow now:
+        1) This endpoint enqueues ONLY the download job.
+        2) on_download_completed (job_state_transitions.py) auto-creates the
+           transcribe job for the same asset, using asset.local_path (the
+           real on-disk file path) instead of source_url.
+        3) on_transcribe_completed triggers ClipSelectionAgent to produce
+           candidates. Render jobs are created later by candidate_lifecycle
+           once a candidate is approved (not pre-created here).
+
+    Idempotent: existing pending/processing download jobs for the same
+    campaign are left untouched. Returns the count of jobs created.
 
     The campaign must be in status='ready' (analyzed with qa_rules). The
-    first asset of the campaign becomes the source for the pipeline.
+    first processable asset of the campaign becomes the source.
     """
     import uuid as _uuid
     from app.models.job import Job
@@ -260,13 +275,16 @@ def enqueue_pipeline(
 
     # Worker contract (verified against clipping-windows-worker payload
     # schemas from real completed jobs, 2026-09-11):
-    #   download.py   line 33 → "payload.url is required"
-    #   transcribe.py line 28 → "payload.video_path or payload.video is required"
-    #   render.py     line 25 → "payload.input_video is required"
+    #   download.py   → requires payload["url"]
+    #   transcribe.py → requires payload["video"] or payload["video_path"]
+    #                    (filled by on_download_completed with asset.local_path)
+    #   render.py     → requires payload["input_video"] (path local en Worker)
+    #                    (created by candidate_lifecycle.approve_candidate
+    #                    with asset.local_path, NOT here)
     #
-    # We send BOTH legacy (source_url) and Worker-expected (url / video_path /
-    # video / input_video) keys so the Worker never sees a missing field.
-    for job_type, payload in [
+    # Solo creamos el job download. El resto se encadena vía
+    # job_state_transitions.on_download_completed → on_transcribe_completed.
+    jobs_to_enqueue = [
         (
             "download",
             {
@@ -277,43 +295,9 @@ def enqueue_pipeline(
                 "destination": f"/tmp/cs_{c.id}_video.mp4",
             },
         ),
-        (
-            "transcribe",
-            {
-                "campaign_id": str(c.id),
-                "asset_id": asset_id,
-                "video_path": asset.source_url,         # Worker contract
-                "video": asset.source_url,              # Worker contract (alt)
-                "url": asset.source_url,                # backwards-compat
-                "source_url": asset.source_url,         # backwards-compat
-                "language": "en",
-            },
-        ),
-        (
-            "render",
-            {
-                "campaign_id": str(c.id),
-                "asset_id": asset_id,
-                "input_video": asset.source_url,        # Worker contract
-                "video_path": asset.source_url,         # backwards-compat
-                "url": asset.source_url,                # backwards-compat
-                "source_url": asset.source_url,         # backwards-compat
-                "format": "9:16",
-                "watermark_url": None,
-                "captions_required": False,
-                # Worker contract (verified against render.py:27 in completed
-                # jobs from campaign 5463): start_time/end_time are required
-                # and must satisfy end_time > start_time.
-                # If we have a known duration, render a full clip; otherwise
-                # pass start=0, end=0 and let the Worker decide (it'll fail
-                # loud, which is better than a silent zero-length render).
-                "start": 0.0,
-                "end": float(asset.duration_seconds) if asset.duration_seconds else 0.0,
-                "start_time": 0.0,
-                "end_time": float(asset.duration_seconds) if asset.duration_seconds else 0.0,
-            },
-        ),
-    ]:
+    ]
+
+    for job_type, payload in jobs_to_enqueue:
         # Idempotency: don't create a new pending job if one is open.
         existing = (
             db.query(Job)

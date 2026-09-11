@@ -343,6 +343,31 @@ def on_qa_completed(
     logger.info(
         "clip %s qa=%s status=%s", clip.id, qa_status, clip.status,
     )
+
+    # ── Step 18: QA pass -> clip lives in pending_upload/ ──
+    # The Worker copies the .mp4 to <storage>/clips/<campaign>/pending_upload/
+    # and reports the new path via `result_data["final_path_worker"]`.
+    # We just record it. If the Worker hasn't reported yet (legacy flow),
+    # we still stamp `location='pending_upload'` so the clip is visible in
+    # the per-campaign folder listing.
+    if qa_status == ClipQAStatus.PASS.value:
+        try:
+            from app.services.clip_storage_service import set_clip_location
+            final_path = None
+            if isinstance(result_data, dict):
+                final_path = result_data.get("final_path_worker")
+            set_clip_location(db, clip.id, "pending_upload", final_path_worker=final_path)
+            logger.info(
+                "clip %s step18: moved to pending_upload (final_path=%s)",
+                clip.id, final_path,
+            )
+        except Exception as e:  # noqa: BLE001
+            # Never fail the QA handler because of step 18 — log and continue.
+            logger.exception(
+                "clip %s step18: failed to set pending_upload location: %s",
+                clip.id, e,
+            )
+
     return clip
 
 

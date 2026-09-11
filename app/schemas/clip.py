@@ -82,3 +82,7 @@ class ClipOut(BaseModel):
     updated_at: datetime
     qa_at: Optional[datetime] = None
     published_at: Optional[datetime] = None
+    # ── Step 18: per-campaign storage location (set by the Worker on QA pass) ──
+    location: Optional[str] = None
+    final_path_worker: Optional[str] = None
+    location_updated_at: Optional[datetime] = None

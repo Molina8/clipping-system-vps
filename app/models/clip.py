@@ -109,6 +109,24 @@ class Clip(Base):
         String(32), nullable=False, server_default="created"
     )
 
+    # ── Storage location (Step 18 of architecture_flow.md) ──
+    # Tracks where the .mp4 physically lives on the Windows Worker.
+    # The Worker copies the clip to the per-campaign folder on QA pass and
+    # moves it again after upload; the VPS just records the resulting path.
+    #   pending_upload  -> waiting to upload to social media
+    #   uploaded        -> already published to social media
+    #   archived        -> taken out of the active rotation
+    # NULL            -> legacy clip, no location yet (pre-Step-18).
+    location: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+    )
+    final_path_worker: Mapped[str | None] = mapped_column(
+        String(1024), nullable=True,
+    )
+    location_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -134,5 +152,9 @@ class Clip(Base):
         CheckConstraint(
             f"status IN {CLIP_STATUS_VALUES!r}",
             name="ck_clips_status",
+        ),
+        CheckConstraint(
+            "location IS NULL OR location IN ('pending_upload', 'uploaded', 'archived')",
+            name="ck_clips_location",
         ),
     )

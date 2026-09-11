@@ -17,6 +17,12 @@ from app.services.clip_service import (
     list_clips,
     update_clip,
 )
+from app.services.clip_storage_service import (
+    VALID_LOCATIONS,
+    list_clips_by_campaign,
+    mark_clip_uploaded,
+    set_clip_location,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,3 +92,90 @@ def update(
     if c is None:
         raise HTTPException(status_code=404, detail="Clip not found")
     return c
+
+
+# ── Step 18: per-campaign clip storage (Worker organizes by campaign) ──
+
+
+@router.get("/by_campaign/{campaign_id}/storage", response_model=List[ClipOut])
+def list_by_campaign_storage(
+    campaign_id: int,
+    location: Optional[str] = Query(
+        None,
+        description="Filter by storage location",
+        enum=list(VALID_LOCATIONS),
+    ),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_bearer),
+):
+    """List clips for a campaign, optionally filtered by storage location
+    (`pending_upload`, `uploaded`, `archived`).
+
+    The Worker keeps the actual `.mp4` files in
+    `C:\\CODIANT\\clipping\\storage\\clips\\<campaign_id>\\{pending_upload|uploaded|archived}\\`.
+    This endpoint returns the same clips with their `file_path` /
+    `final_path_worker` pointing at the right folder.
+    """
+    try:
+        return list_clips_by_campaign(
+            db,
+            campaign_id=campaign_id,
+            location=location,
+            limit=limit,
+            offset=offset,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/{clip_id}/mark_uploaded", response_model=ClipOut)
+def mark_uploaded(
+    clip_id: uuid.UUID,
+    final_path_worker: Optional[str] = Query(
+        None,
+        max_length=1024,
+        description="New Windows path after the Worker moves the file to "
+                    "`uploaded/`. Optional; if omitted, the previous "
+                    "`final_path_worker` is preserved.",
+    ),
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_bearer),
+):
+    """Worker calls this after successfully publishing the clip to social media.
+
+    Sets `location='uploaded'` and `published_at=now()`. The Worker is
+    responsible for actually moving the .mp4 from `pending_upload/` to
+    `uploaded/` before calling this endpoint.
+    """
+    clip = mark_clip_uploaded(db, clip_id, final_path_worker=final_path_worker)
+    if clip is None:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    return clip
+
+
+@router.post("/{clip_id}/location/{location}", response_model=ClipOut)
+def set_location(
+    clip_id: uuid.UUID,
+    location: str,
+    final_path_worker: Optional[str] = Query(None, max_length=1024),
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_bearer),
+):
+    """Generic endpoint for the Worker to record where the clip lives.
+
+    Used when the Worker needs to re-tag an already-uploaded clip (e.g. move
+    it to `archived/` after the campaign ends). For the common
+    `qa_pass -> pending_upload` transition, prefer the implicit hook in
+    `job_state_transitions.on_qa_completed`.
+    """
+    if location not in VALID_LOCATIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"location must be one of {list(VALID_LOCATIONS)}, got {location!r}",
+        )
+    clip = set_clip_location(db, clip_id, location, final_path_worker=final_path_worker)
+    if clip is None:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    return clip

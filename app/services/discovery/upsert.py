@@ -5,9 +5,10 @@ import logging
 import re
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.models.asset import Asset
 from app.models.campaign import Campaign, CampaignStatus
 from app.services.discovery.models import DiscoveredCampaign
 
@@ -148,9 +149,20 @@ def upsert_campaign(
                 detail_url=discovered.detail_url,
             )
             existing.name = _unique_name(db, base, exclude_id=existing.id)
+        # Always recompute assets_count from the source of truth. Without this,
+        # `enqueue_pipeline` would skip the campaign (no processable assets)
+        # even after a successful discovery + asset resolution.
+        actual_count = db.execute(
+            select(func.count(Asset.id)).where(Asset.campaign_id == existing.id)
+        ).scalar_one()
+        existing.assets_count = int(actual_count or 0)
         db.commit()
         db.refresh(existing)
-        logger.debug("upsert_campaign: updated %s", existing.name)
+        logger.debug(
+            "upsert_campaign: updated %s (assets_count=%d)",
+            existing.name,
+            existing.assets_count,
+        )
         return existing
 
     # New campaign — always use a representative, glanceable name.

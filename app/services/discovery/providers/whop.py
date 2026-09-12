@@ -1,22 +1,37 @@
 """WhopProvider — discovers campaigns from a Whop tenant sub-app.
 
-Whop renders campaign data in plain HTML on the `discover` sub-app:
-  https://{tenant}.apps.whop.com/discover
-This works without API key / OAuth / browser headless.
+PRIMARY path (2026-09-11): JSON API.
 
-Each card is anchored by an `<a href="https://whop.com/experiences/{exp}/campaigns/{uuid}">`
-that contains the campaign name. The CPM/prize/joined numbers are in
-sibling text (outside the </a>) but rendered in the same chunk of HTML.
+The Whop `discover` sub-app exposes a public, unauthenticated JSON endpoint
+that the SPA fetches to render its cards:
 
-This provider's `discover()` parses those cards and returns DiscoveredCampaign
-records. `fetch_detail()` then loads the campaign detail page to extract
-asset links (Drive/YouTube/Sheets/Dropbox/Mega).
+    GET {tenant}/api/campaign/campaigns/discover?limit={n}&sortBy={trending|...}
+
+It returns `{"data":[...], "pagination":{...}, "success":true}` where each
+campaign has:
+  - id (UUID), name, description
+  - cpmMinRateCents / cpmMaxRateCents (USD cents per 1k views)
+  - budgetCents (USD cents, total prize pool)
+  - metrics.approvedSubmissionCount (joined)
+  - payouts[] with platform + rateCents
+  - referenceMaterials[] with mediaType + url (asset links)
+  - organizationExperienceId / organizationName
+
+So we just call the API. Fast (~200ms), no Playwright needed, no auth.
+
+FALLBACK path (kept for resilience): Playwright scraping of the SPA cards.
+Used only if the API returns 4xx/5xx or empty data. Disabled by default
+since the API works.
+
+This provider's `discover()` returns DiscoveredCampaign records.
+`fetch_detail()` enriches each with asset links from `referenceMaterials`.
 """
 from __future__ import annotations
 
 import html
 import json
 import logging
+import os
 import re
 import urllib.error
 import urllib.request
@@ -26,6 +41,12 @@ from app.services.discovery.base import CampaignProvider
 from app.services.discovery.models import DiscoveredCampaign
 
 logger = logging.getLogger(__name__)
+
+
+_USE_PLAYWRIGHT = os.environ.get("WHOP_USE_PLAYWRIGHT", "0") != "0"
+_PLAYWRIGHT_TIMEOUT_MS = int(os.environ.get("WHOP_DISCOVER_TIMEOUT_MS", "30000"))
+_API_TIMEOUT_S = float(os.environ.get("WHOP_API_TIMEOUT_S", "15"))
+_API_PAGE_SIZE = int(os.environ.get("WHOP_API_PAGE_SIZE", "50"))
 
 
 _DEFAULT_UA = (
@@ -134,41 +155,312 @@ class WhopProvider(CampaignProvider):
 
     def discover(self, *, limit: int = 50) -> list[DiscoveredCampaign]:
         url = f"{self.tenant_url}/discover"
-        try:
-            src = self._fetch(url)
-        except (urllib.error.URLError, OSError, TimeoutError) as e:
-            logger.warning("whop discover fetch failed: %s", e)
-            return []
+        cards: list[dict[str, Any]] = []
+        fetch_failed = False
+        # PRIMARY: JSON API.
+        api_cards, api_err = self._discover_via_api(limit=limit)
+        if api_err:
+            fetch_failed = True
+            logger.warning("whop API discover failed: %s", api_err)
+        elif api_cards:
+            cards = api_cards
+            logger.info("whop API discover: %d cards", len(cards))
+        # FALLBACK: Playwright SPA scrape (opt-in via WHOP_USE_PLAYWRIGHT=1).
+        if not cards and _USE_PLAYWRIGHT:
+            pw_cards, pw_error = self._discover_with_playwright(url)
+            if pw_error:
+                fetch_failed = True
+                logger.warning("whop playwright discover failed: %s", pw_error)
+            elif pw_cards:
+                cards = pw_cards
+                logger.info("whop playwright discover: %d cards", len(cards))
+        # FALLBACK: plain HTML regex (rarely useful since the SPA renders cards client-side).
+        if not cards and not fetch_failed:
+            try:
+                src = self._fetch(url)
+                cards = self._parse_cards_from_html(src)
+            except (urllib.error.URLError, OSError, TimeoutError) as e:
+                logger.warning("whop plain-html discover failed: %s", e)
+                fetch_failed = True
 
-        cards = self._parse_cards(src)
         out: list[DiscoveredCampaign] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[str] = set()
         for c in cards:
-            key = (c["experience_id"], c["campaign_uuid"])
-            if key in seen:
+            camp_uuid = c["campaign_uuid"]
+            if camp_uuid in seen:
                 continue
-            seen.add(key)
+            seen.add(camp_uuid)
             dc = DiscoveredCampaign(
                 provider="whop",
-                external_id=f"{c['experience_id']}/{c['campaign_uuid']}",
+                external_id=f"{c.get('experience_id','?')}/{camp_uuid}",
                 detail_url=c["detail_url"],
                 name=c["name"],
                 description=c.get("description"),
                 cpm_usd_per_1k=c.get("cpm"),
                 prize_pool_usd=c.get("prize_pool"),
                 joined=c.get("joined"),
-                asset_links=[],
+                asset_links=c.get("asset_links", []),
                 raw={
-                    "experience_id": c["experience_id"],
-                    "campaign_uuid": c["campaign_uuid"],
+                    "experience_id": c.get("experience_id"),
+                    "campaign_uuid": camp_uuid,
                     "card_text": c.get("description"),
+                    "fetch_failed": fetch_failed,
                 },
             )
             out.append(dc)
             if len(out) >= limit:
                 break
-        logger.info("whop discover: %d unique campaigns from %s", len(out), self.tenant_url)
+        logger.info(
+            "whop discover: %d unique campaigns from %s (fetch_failed=%s)",
+            len(out), self.tenant_url, fetch_failed,
+        )
         return out
+
+    # --- API discovery -----------------------------------------------------
+
+    def _discover_via_api(self, *, limit: int) -> tuple[list[dict[str, Any]] | None, str | None]:
+        """Call Whop's public JSON API for the campaign list.
+
+        Returns (cards, None) on success, (None, error) on failure, and
+        ([], None) when the API returns no data.
+        """
+        from urllib.parse import urlencode
+
+        api_base = f"{self.tenant_url}/api/campaign/campaigns/discover"
+        per_page = min(limit, _API_PAGE_SIZE) if _API_PAGE_SIZE > 0 else limit
+        params = urlencode({"limit": per_page, "sortBy": "trending"})
+        url = f"{api_base}?{params}"
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": self.ua,
+                    "Accept": "application/json",
+                    "Referer": f"{self.tenant_url}/discover",
+                    "Origin": self.tenant_url,
+                },
+            )
+            with urllib.request.urlopen(req, timeout=_API_TIMEOUT_S) as r:
+                payload = json.loads(r.read().decode("utf-8", errors="replace"))
+        except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError) as e:
+            return None, f"{type(e).__name__}: {e}"
+
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            return None, f"unexpected_payload: {str(payload)[:200]}"
+        data = payload.get("data") or []
+        if not isinstance(data, list):
+            return None, "data_not_list"
+        cards: list[dict[str, Any]] = []
+        for c in data:
+            card = self._api_card_to_struct(c)
+            if card:
+                cards.append(card)
+        return cards, None
+
+    def _api_card_to_struct(self, c: dict[str, Any]) -> dict[str, Any] | None:
+        """Map a JSON API campaign record to the internal card dict."""
+        try:
+            camp_uuid = c.get("id")
+            exp_id = c.get("organizationExperienceId") or ""
+            if not camp_uuid or not exp_id:
+                return None
+            name = (c.get("name") or "").strip() or f"Whop campaign {camp_uuid[:8]}"
+            description = c.get("description") or None
+            cpm_cents = c.get("cpmMinRateCents")
+            cpm = float(cpm_cents) / 100.0 if cpm_cents is not None else None
+            budget_cents = c.get("budgetCents")
+            pool = float(budget_cents) / 100.0 if budget_cents is not None else None
+            metrics = c.get("metrics") or {}
+            joined = metrics.get("approvedSubmissionCount")
+            try:
+                joined = int(joined) if joined is not None else None
+            except (TypeError, ValueError):
+                joined = None
+            asset_links: list[str] = []
+            for rm in c.get("referenceMaterials") or []:
+                if isinstance(rm, dict) and rm.get("url"):
+                    asset_links.append(rm["url"])
+            return {
+                "experience_id": exp_id,
+                "campaign_uuid": camp_uuid,
+                "detail_url": f"https://whop.com/experiences/{exp_id}/campaigns/{camp_uuid}",
+                "name": name,
+                "description": description,
+                "cpm": cpm,
+                "prize_pool": pool,
+                "joined": joined,
+                "asset_links": asset_links,
+                "raw_api": {
+                    "organization_name": c.get("organizationName"),
+                    "organization_verified": c.get("organizationVerified"),
+                    "platforms": c.get("platforms"),
+                    "payouts": c.get("payouts"),
+                    "requires_application": c.get("requiresApplication"),
+                    "status": c.get("status"),
+                    "primary_payout_cents": c.get("primaryPayoutCents"),
+                },
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.warning("whop api_card_to_struct failed: %s", e)
+            return None
+
+    # --- Playwright (SPA) discovery ----------------------------------------
+
+    def _discover_with_playwright(self, url: str) -> tuple[list[dict[str, Any]] | None, str | None]:
+        """Render `/discover` in headless Chromium and extract cards.
+
+        Returns (cards, None) on success, (None, error) on failure, and
+        ([], None) when no cards were rendered.
+        """
+        try:
+            from playwright.sync_api import sync_playwright  # type: ignore
+        except Exception as e:  # noqa: BLE001
+            return None, f"playwright_not_installed: {e}"
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"],
+                )
+                try:
+                    page = browser.new_page(
+                        viewport={"width": 1400, "height": 900},
+                        user_agent=self.ua,
+                        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+                    )
+                    page.goto(url, wait_until="domcontentloaded", timeout=_PLAYWRIGHT_TIMEOUT_MS)
+                    try:
+                        page.wait_for_selector(
+                            'a[href*="/campaigns/"]', timeout=_PLAYWRIGHT_TIMEOUT_MS
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.info("whop SPA: no /campaigns/ anchors in %dms", _PLAYWRIGHT_TIMEOUT_MS)
+                        return [], None
+                    # Give the SPA another beat to render sibling numbers.
+                    page.wait_for_timeout(2500)
+                    raw_cards = page.evaluate(
+                        r"""
+                        () => {
+                          const anchors = Array.from(document.querySelectorAll('a[href*="/campaigns/"]'));
+                          const seen = new Set();
+                          const out = [];
+                          for (const a of anchors) {
+                            if (seen.has(a.href)) continue;
+                            seen.add(a.href);
+                            let card = a;
+                            let txt = '';
+                            for (let i = 0; i < 8 && card; i++) {
+                              card = card.parentElement;
+                              if (!card) break;
+                              txt = (card.innerText || '');
+                              if (txt.includes('$') && txt.length < 800 && txt.length > 30) break;
+                            }
+                            out.push({
+                              href: a.href,
+                              text: (txt || '').replace(/\\s+/g, ' ').trim().slice(0, 800),
+                            });
+                          }
+                          return out;
+                        }
+                        """
+                    )
+                finally:
+                    browser.close()
+        except Exception as e:  # noqa: BLE001
+            return None, f"{type(e).__name__}: {e}"
+        # Parse the (href, card_text) tuples into the same dict shape as
+        # _parse_cards_from_html.
+        return self._parse_cards_from_rendered(raw_cards), None
+
+    def _parse_cards_from_rendered(self, raw_cards: list[dict[str, str]]) -> list[dict[str, Any]]:
+        """Parse [{href, text}, ...] tuples into the structured card dicts."""
+        out: list[dict[str, Any]] = []
+        anchor_re = re.compile(
+            r"^https?://whop\.com/experiences/(exp_[A-Za-z0-9_]+)/campaigns/([a-f0-9-]{36})/?$"
+        )
+        for rc in raw_cards:
+            m = anchor_re.match(rc.get("href", ""))
+            if not m:
+                continue
+            exp_id, camp_uuid = m.group(1), m.group(2)
+            plano = (rc.get("text") or "").strip()
+            if not plano:
+                continue
+            # Name = first phrase before the first "$" or before "joined".
+            nombre = re.split(r"\s*\$", plano, maxsplit=1)[0].strip()
+            nombre = re.split(r"\s+\d[\d.,]*\s*[KkMm]?\s+joined", nombre, maxsplit=1)[0].strip()
+            nombre = re.sub(r"^(?:\d+\s*[a-z]+\s+ago|\d+[moMO]+)\s+", "", nombre)
+            nombre = re.sub(r"\s+\d+\s*$", "", nombre)
+            nombre = re.sub(r"\s+", " ", nombre)
+            nombre = re.sub(r"^Join Campaign Preview\s+", "", nombre, flags=re.I)
+            if not nombre or len(nombre) < 3:
+                first_chunk = re.split(r"[\s,]+", plano, maxsplit=8)
+                cleaned = [
+                    w for w in first_chunk
+                    if not w.startswith("$") and not w.endswith("ago") and not w.endswith("mo") and len(w) > 2
+                ][:6]
+                nombre = " ".join(cleaned) + f" ({exp_id[:8]})" if cleaned else f"Whop campaign {exp_id[:8]}"
+            if len(nombre) > 120:
+                nombre = nombre[:120]
+            out.append({
+                "experience_id": exp_id,
+                "campaign_uuid": camp_uuid,
+                "detail_url": f"https://whop.com/experiences/{exp_id}/campaigns/{camp_uuid}",
+                "name": nombre,
+                "cpm": _parse_cpm(plano),
+                "prize_pool": _parse_prize_pool_usd(plano),
+                "joined": _parse_joined(plano),
+                "description": plano[:400],
+            })
+        return out
+
+    def _parse_cards_from_html(self, src: str) -> list[dict[str, Any]]:
+        """Plain-HTML fallback parser (kept for resilience)."""
+        pat = re.compile(
+            r'<a[^>]*href="(https://whop\.com/experiences/(exp_[A-Za-z0-9]{14,16})'
+            r'/campaigns/([a-f0-9-]{36}))"[^>]*>',
+            re.S,
+        )
+        anchors = list(pat.finditer(src))
+        cards: list[dict[str, Any]] = []
+        for i, m in enumerate(anchors):
+            detail_url, exp_id, camp_uuid = m.group(1), m.group(2), m.group(3)
+            start = m.end()
+            end = anchors[i + 1].start() if i + 1 < len(anchors) else min(start + 8000, len(src))
+            bloque = src[start:end]
+            plano = re.sub(r"<[^>]+>", " ", bloque)
+            plano = html.unescape(plano)
+            plano = re.sub(r"\s+", " ", plano).strip()
+            cards.append({
+                "experience_id": exp_id,
+                "campaign_uuid": camp_uuid,
+                "detail_url": detail_url,
+                "name": self._extract_name_from_text(plano, exp_id),
+                "cpm": _parse_cpm(plano),
+                "prize_pool": _parse_prize_pool_usd(plano),
+                "joined": _parse_joined(plano),
+                "description": plano[:400],
+            })
+        return cards
+
+    @staticmethod
+    def _extract_name_from_text(plano: str, exp_id: str) -> str:
+        nombre = re.split(r"\s*\$", plano, maxsplit=1)[0].strip()
+        nombre = re.split(r"\s+\d[\d.,]*\s*[KkMm]?\s+joined", nombre, maxsplit=1)[0].strip()
+        nombre = re.sub(r"^(?:\d+\s*[a-z]+\s+ago|\d+[moMO]+)\s+", "", nombre)
+        nombre = re.sub(r"\s+\d+\s*$", "", nombre)
+        nombre = re.sub(r"\s+", " ", nombre)
+        nombre = re.sub(r"^Join Campaign Preview\s+", "", nombre, flags=re.I)
+        if not nombre or len(nombre) < 3:
+            first_chunk = re.split(r"[\s,]+", plano, maxsplit=8)
+            cleaned = [
+                w for w in first_chunk
+                if not w.startswith("$") and not w.endswith("ago") and not w.endswith("mo") and len(w) > 2
+            ][:6]
+            nombre = " ".join(cleaned) + f" ({exp_id[:8]})" if cleaned else f"Whop campaign {exp_id[:8]}"
+        if len(nombre) > 120:
+            nombre = nombre[:120]
+        return nombre
 
     # Hosts where asset links ACTUALLY live. Discovered by inspecting real
     # Whop detail HTML (Yomi Denzel, 2026-09-10): asset binaries are served from

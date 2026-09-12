@@ -1,7 +1,18 @@
-"""FastAPI application entrypoint."""
-import asyncio
+"""FastAPI application entrypoint.
+
+NOTE (2026-09-11): The previous in-process `_analyze_loop` and
+`_discovery_loop` asyncio tasks have been removed. Both responsibilities
+have moved to the OpenClaw scheduler:
+
+  - Step 1 (Whop discovery): OpenClaw cron `whop-discovery-cron` →
+    scripts/whop_discovery.py (every 6h).
+  - Steps 2/3 (analyze + drain): OpenClaw cron `vps-pipeline-tick` →
+    scripts/vps_pipeline_tick.py (every 10m).
+
+The API now has zero background tasks. All cadence lives in the scheduler,
+which gives us a run ledger, retry, and inspection.
+"""
 import logging
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
@@ -20,99 +31,11 @@ logging.basicConfig(
 logger = logging.getLogger("clipping-api")
 
 
-# --- Steps 1 + 2 + 3 cron (architecture_flow.md) --------------------------
-# Step 1 [OPENCLAW CRON]: every N minutes, scan draft campaigns with
-# source_instructions and trigger analyze_campaign() so they get a spec.
-# (Campaign *discovery* itself is still manual / OpenClaw-side; we only
-# automate the analyze step on the VPS here.)
-_ANALYZE_INTERVAL_S = 600  # 10 min
-
-
-async def _analyze_loop() -> None:
-    from app.db.database import SessionLocal
-    from app.services.campaign_analyzer import analyze_due_campaigns
-    while True:
-        try:
-            await asyncio.sleep(_ANALYZE_INTERVAL_S)
-            db = SessionLocal()
-            try:
-                results = analyze_due_campaigns(db, limit=50)
-                if results:
-                    logger.info(
-                        "analyze_loop processed %d draft campaigns",
-                        len(results),
-                    )
-                # Backlog drain: enqueue download+transcribe+render for any
-                # 'ready' campaign without open jobs. Closes the wiring gap
-                # discovered when the Worker ran without an explicit enqueue.
-                from app.api.campaigns import enqueue_all_ready
-                drain = enqueue_all_ready(db=db, limit=50)
-                logger.info(
-                    "backlog drain: scanned=%d enqueued=%d skipped=%d",
-                    drain["scanned"], drain["enqueued"], drain["skipped"],
-                )
-            finally:
-                db.close()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            logger.exception("analyze_loop iteration failed: %s", e)
-
-
-# --- Step 1 discovery cron (architecture_flow.md) --------------------------
-# Every DISCOVERY_INTERVAL_S hours: run all providers, upsert campaigns,
-# resolve assets, then analyze the new draft campaigns.
-_DISCOVERY_INTERVAL_S = 6 * 3600  # 6h
-
-
-async def _discovery_loop() -> None:
-    from app.db.database import SessionLocal
-    from app.services.campaign_analyzer import analyze_due_campaigns
-    from app.services.discovery.upsert import run_discovery
-    while True:
-        try:
-            await asyncio.sleep(_DISCOVERY_INTERVAL_S)
-            db = SessionLocal()
-            try:
-                summary = run_discovery(db, fetch_detail=True, limit=50)
-                analyzed = analyze_due_campaigns(db, limit=50)
-                summary["analyzed"] = len(analyzed)
-                logger.info(
-                    "discovery_loop: %s",
-                    summary,
-                )
-            finally:
-                db.close()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            logger.exception("discovery_loop iteration failed: %s", e)
-
-
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    analyze_task = asyncio.create_task(
-        _analyze_loop(), name="campaign-analyze-loop"
-    )
-    discovery_task = asyncio.create_task(
-        _discovery_loop(), name="campaign-discovery-loop"
-    )
-    try:
-        yield
-    finally:
-        for t in (analyze_task, discovery_task):
-            t.cancel()
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-
-
 app = FastAPI(
     title="Clipping API",
-    version="0.2.0",
-    description="Backend coordinator for the clipping pipeline (VPS side).",
-    lifespan=lifespan,
+    version="0.3.0",
+    description="Backend coordinator for the clipping pipeline (VPS side). "
+    "All scheduled work runs from OpenClaw automations.",
 )
 import traceback as _tb
 _DEBUG_LOG_PATH = "/tmp/discovery_debug.log"

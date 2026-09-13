@@ -223,11 +223,23 @@ def run_discovery(db: Session, *, fetch_detail: bool = True, limit: int = 50) ->
             continue
 
         if fetch_detail:
-            for d in discovered:
+            # Concurrent fetch_detail (8 workers) so 50-campaign discovery doesn't
+            # take 25s+ on slow whop.com pages. Failures are logged and skipped —
+            # the campaign still has its card-level asset_links.
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _safe_fetch(d):
                 try:
-                    provider.fetch_detail(d)
+                    return provider.fetch_detail(d)
                 except Exception as e:  # noqa: BLE001
-                    logger.info("provider %s fetch_detail failed for %s: %s", provider.name, d.external_id, e)
+                    logger.info(
+                        "provider %s fetch_detail failed for %s: %s",
+                        provider.name, d.external_id, e,
+                    )
+                    return None
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(_safe_fetch, discovered, timeout=20))
 
         upserted = 0
         assets_created = 0
@@ -237,6 +249,16 @@ def run_discovery(db: Session, *, fetch_detail: bool = True, limit: int = 50) ->
             if d.asset_links:
                 new_assets = resolve_assets_for_campaign(db, c.id, d.asset_links, discovery_provider=provider.name)
                 assets_created += len(new_assets)
+                # Re-read the counter after asset resolution so enqueue_pipeline
+                # sees the right value for brand-new campaigns (where upsert_campaign
+                # initialized assets_count=0).
+                c.assets_count = (
+                    db.execute(
+                        select(func.count(Asset.id)).where(Asset.campaign_id == c.id)
+                    ).scalar_one()
+                    or 0
+                )
+                db.commit()
 
         summary["providers"][provider.name] = {
             "discovered": len(discovered),

@@ -119,6 +119,35 @@ class ClipSelectionAgent:
         spec = normalize(hints, campaign.source_provider)
         spec_dict = spec.model_dump()
 
+        # --- 2b. Pull campaign brief (if any) from extra_metadata --------
+        # A campaign may have one or more 'brief' assets (PDFs / Google Docs
+        # extracted by brief_extractor). We pick the most recently extracted
+        # one with the largest char_count as the canonical brief for this
+        # campaign and feed it to the LLM so it has the *real* rules.
+        campaign_brief: dict | None = None
+        try:
+            brief_assets = (
+                db.query(Asset)
+                .filter(
+                    Asset.campaign_id == campaign.id,
+                    Asset.asset_type == "brief",
+                )
+                .all()
+            )
+            for ba in brief_assets:
+                em = ba.extra_metadata or {}
+                b = em.get("brief")
+                if not isinstance(b, dict):
+                    continue
+                if not (b.get("text") or "").strip():
+                    continue
+                if campaign_brief is None or int(b.get("char_count") or 0) > int(
+                    campaign_brief.get("char_count") or 0
+                ):
+                    campaign_brief = b
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("campaign_brief load failed for %d: %s", campaign.id, exc)
+
         # --- 3. Pull transcription from asset.extra_metadata ------------
         transcription = (asset.extra_metadata or {}).get("transcription") or {}
         transcription_text = transcription.get("text", "") or ""
@@ -130,6 +159,7 @@ class ClipSelectionAgent:
             duration_seconds=float(asset.duration_seconds or 0.0),
             transcription=transcription,
             spec=spec_dict,
+            campaign_brief=campaign_brief,
         )
         try:
             raw_text, model_id = self.llm_client.complete(SYSTEM_PROMPT, user_prompt)
@@ -219,6 +249,13 @@ class ClipSelectionAgent:
         logger.info(
             "clip_selection.done asset=%s generated=%d valid=%d persisted=%d model=%s",
             asset_id, len(proposals), len(valid), len(created), model_id or "?",
+        )
+        logger.info(
+            "clip_selection.brief asset=%s has_brief=%s chars=%d urls=%d",
+            asset_id,
+            "yes" if campaign_brief else "no",
+            int((campaign_brief or {}).get("char_count") or 0),
+            len((campaign_brief or {}).get("feature_urls") or []),
         )
         logger.info(
             "clip_selection.done asset=%s generated=%d valid=%d persisted=%d model=%s",

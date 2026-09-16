@@ -57,8 +57,10 @@ def build_user_prompt(
     duration_seconds: float,
     transcription: dict,
     spec: dict,
+    *,
+    campaign_brief: dict | None = None,
 ) -> str:
-    """Build the USER-side prompt from the asset + campaign spec.
+    """Build the USER-side prompt from the asset + campaign spec + optional brief.
 
     The transcription dict is expected to come from the transcribe
     job's `result.data` and usually has:
@@ -67,7 +69,25 @@ def build_user_prompt(
         "segments": [ {"start", "end", "text"}, ... ],
         "words":    [ {"word", "start", "end", "score"}, ... ] }
     Anything missing is silently skipped.
+
+    `campaign_brief` (optional) is the structured brief extracted from the
+    campaign's Drive docs/PDFs by `app.services.discovery.brief_extractor`.
+    Expected shape (from `BriefContent.to_dict()`):
+      { "text": "...full text...",
+        "feature_urls": [...],
+        "sections": [{"title": "...", "body": "..."}, ...],
+        "page_count": 4,
+        "mime_type": "application/pdf",
+        "char_count": 7000 }
+
+    We inject the brief as a markdown block right after the campaign spec
+    so the LLM has the *real* rules (lanes, payouts, banned content,
+    official audio links) instead of inventing them. We cap the text to
+    `BRIEF_TEXT_MAX_CHARS` to keep the prompt bounded.
     """
+    BRIEF_TEXT_MAX_CHARS = 4000
+    BRIEF_URLS_MAX = 20
+
     duration_min = float(spec.get("duration_min") or 20.0)
     duration_max = float(spec.get("duration_max") or 60.0)
     fmt = spec.get("format") or "9:16"
@@ -103,12 +123,58 @@ def build_user_prompt(
         if words else ""
     )
 
+    # --- Campaign brief injection (if present) ---------------------------
+    brief_block = ""
+    if campaign_brief and isinstance(campaign_brief, dict):
+        full_text = (campaign_brief.get("text") or "").strip()
+        feature_urls = list(campaign_brief.get("feature_urls") or [])
+        sections = list(campaign_brief.get("sections") or [])
+        page_count = campaign_brief.get("page_count")
+        mime = campaign_brief.get("mime_type") or "unknown"
+
+        # Truncate text to keep tokens bounded.
+        text_excerpt = full_text[:BRIEF_TEXT_MAX_CHARS]
+        if len(full_text) > BRIEF_TEXT_MAX_CHARS:
+            text_excerpt += f"\n\n[... truncated at {BRIEF_TEXT_MAX_CHARS} of {len(full_text)} chars]"
+
+        # Section excerpts (only headings + first 200 chars of body each).
+        section_lines: list[str] = []
+        for s in sections:
+            title = (s.get("title") or "").strip()
+            body = (s.get("body") or "").strip()
+            if not title and not body:
+                continue
+            excerpt = body[:200] + ("..." if len(body) > 200 else "")
+            section_lines.append(f"### {title or '(preamble)'}\n{excerpt}")
+
+        # Feature URLs (cap).
+        urls = feature_urls[:BRIEF_URLS_MAX]
+        urls_block = "\n".join(f"- {u}" for u in urls) if urls else "(none found)"
+        more_urls = (
+            f"\n- ... ({len(feature_urls) - BRIEF_URLS_MAX} more)"
+            if len(feature_urls) > BRIEF_URLS_MAX else ""
+        )
+
+        page_note = f"{page_count}-page " if page_count else ""
+        brief_block = (
+            f"\n\n# Campaign brief (extracted from {page_note}{mime})\n"
+            "Follow these rules and lanes EXACTLY. Do NOT invent rules.\n\n"
+            "## Rules & lanes (excerpt)\n"
+            f"{text_excerpt or '(empty brief)'}\n\n"
+            "## Sections detected\n"
+            + ("\n\n".join(section_lines) if section_lines else "(no sections detected)")
+            + "\n\n## Feature / source URLs found in the brief\n"
+            + urls_block + more_urls
+            + "\n"
+        )
+
     return (
         "# Video metadata\n"
         f"- source_url: {source_url}\n"
         f"- duration: {float(duration_seconds or 0):.1f}s\n\n"
         "# Campaign spec\n"
         + "\n".join(spec_lines)
+        + brief_block
         + "\n\n# Transcription (segments)\n"
         + (segments_text if segments_text else (text[:5000] if text else "(empty)"))
         + word_note

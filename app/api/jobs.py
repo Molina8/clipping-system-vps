@@ -93,6 +93,10 @@ class WorkerResultCreate(BaseModel):
 
 
 class WorkerFailCreate(BaseModel):
+    # Ignore extra fields silently: Worker implementations vary (stage, stack_trace,
+    # exit_code, retry, ...) and a strict schema caused 422s that left jobs stuck
+    # in `processing` when the Worker tried to report a real failure.
+    model_config = {"extra": "ignore"}
     error_message: str = Field(..., min_length=1, max_length=2048)
 
 

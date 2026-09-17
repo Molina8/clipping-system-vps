@@ -109,6 +109,7 @@ def _is_representative(name: str | None, provider: str) -> bool:
 def upsert_campaign(
     db: Session,
     discovered: DiscoveredCampaign,
+    status: str | None = None,
 ) -> Campaign:
     """Create or update a Campaign from a DiscoveredCampaign.
 
@@ -117,6 +118,11 @@ def upsert_campaign(
 
     If a Campaign with the same name exists, we update its source metadata
     + spec extras without changing its status.
+
+    `status` only applies when creating a NEW campaign; ignored on updates
+    (the existing status is preserved). Pipeline v2 (2026-09-17) passes
+    status='discovered' from the whop-discovery cron so paso 1 doesn't
+    pretend to be paso 3.
     """
     # Lookup by source_provider + source_url (detail_url) — the canonical key.
     # JSONB lookup would be cleaner but psycopg2 JSON access is finicky with NULLs.
@@ -177,7 +183,7 @@ def upsert_campaign(
 
     c = Campaign(
         name=name,
-        status=CampaignStatus.DRAFT.value,
+        status=status or CampaignStatus.DRAFT.value,
         source_provider=discovered.provider,
         source_url=discovered.detail_url,
         source_metadata=metadata,

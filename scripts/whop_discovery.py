@@ -4,10 +4,16 @@
 Standalone script (no FastAPI context) so the OpenClaw scheduler can run it
 as a `command` payload with a working directory of `/opt/clipping-system`.
 
-What it does (architecture_flow.md steps 1+3):
+What it does (architecture_flow.md step 1 — pipeline v2, 2026-09-17):
   1. Discover campaigns from the Whop public JSON API.
   2. Upsert into `campaigns` (representative names: "[whop] $X/1k · $Yk · Name").
-  3. Run `analyze_due_campaigns` so draft campaigns get a spec → ready.
+     ONLY basic fields: name, cpm_usd_per_1k, prize_pool_usd, source_url,
+     source_instructions (raw brief text), source_provider='whop'.
+     status='discovered'. NO assets. NO spec. NO analysis.
+
+Pipeline v2: paso 3 is split into 3a (brief-reader-tick), 3b (drive-resolver-tick)
+and 3c (campaign-scorer-tick). Each of those crons picks up campaigns in the
+right status and writes its own piece. This script must NOT do any of that.
 
 Output policy (kept tight to avoid spamming Telegram):
   - Logs go to `/opt/clipping-system/logs/whop_discovery.log`.
@@ -82,12 +88,6 @@ def main() -> int:
         action="store_true",
         help="discover only, don't touch the DB",
     )
-    p.add_argument(
-        "--analyze",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="run analyze_due_campaigns after upsert",
-    )
     args = p.parse_args()
 
     from app.db.database import SessionLocal
@@ -98,7 +98,6 @@ def main() -> int:
         "discovered": 0,
         "upserted": 0,
         "assets_created": 0,
-        "analyzed": 0,
         "campaigns": [],
         "dry_run": args.dry_run,
         "limit": args.limit,
@@ -136,32 +135,20 @@ def main() -> int:
             print(json.dumps(summary))
             return 0
 
-        from app.services.discovery.asset_resolver import resolve_assets_for_campaign
         from app.services.discovery.upsert import upsert_campaign
 
+        # Pipeline v2: minimal upsert only. No assets, no analyze.
+        # Asset resolution and brief scoring live in crons 3a/3b/3c.
         upserted = 0
-        assets_created = 0
         for d in discovered:
-            c = upsert_campaign(db, d)
+            c = upsert_campaign(db, d, status="discovered")
             upserted += 1
-            if d.asset_links:
-                new_assets = resolve_assets_for_campaign(
-                    db, c.id, d.asset_links, discovery_provider="whop"
-                )
-                assets_created += len(new_assets)
             summary["campaigns"].append(
                 {"id": c.id, "name": c.name, "status": c.status}
             )
 
         summary["upserted"] = upserted
-        summary["assets_created"] = assets_created
-
-        if args.analyze:
-            from app.services.campaign_analyzer import analyze_due_campaigns
-
-            results = analyze_due_campaigns(db, limit=args.limit)
-            summary["analyzed"] = len(results)
-            logger.info("analyze_due_campaigns processed %d campaigns", len(results))
+        summary["assets_created"] = 0
 
         print(json.dumps(summary))
         logger.info(

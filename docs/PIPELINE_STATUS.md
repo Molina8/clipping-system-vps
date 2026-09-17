@@ -26,7 +26,7 @@
 | 4 | Guardar campaign + spec/rules/score | VPS Backend (`PATCH /campaigns/{id}`) | ✅ |
 | 5 | Asset Resolver (legacy) | VPS Backend (`resolve_assets_for_campaign`) | ✅ ya no se llama desde paso 1 |
 | 6 | Registrar vídeos en BD | VPS Backend (alta en `assets`) | ✅ |
-| 7 | Crear DOWNLOAD JOBS | VPS Backend (auto post-alta) | ✅ |
+| 7 | Crear DOWNLOAD JOBS | **OpenClaw / CRON** `download-enqueue-tick` (10m) | ✅ pipeline v2 |
 | 8 | Worker descarga | **Worker Windows** (Molina) | ✅ |
 | 9 | Marcar DOWNLOADED + crear TRANSCRIBE JOB | VPS Backend (auto, callback Worker) | ✅ |
 | 10 | Worker transcribe (WhisperX) | **Worker Windows** (Molina) | ✅ |
@@ -66,6 +66,7 @@
 | `335f304e-...` | `brief-reader-tick` ⭐ nuevo | 1h30m | isolated | agentTurn — paso 3a, status='discovered' → 'briefed' | Clipper |
 | `d1f2e08e-...` | `drive-resolver-tick` ⭐ nuevo | 1h30m | isolated | agentTurn — paso 3b, status='briefed' → 'assets_resolved' | Clipper |
 | `9ec4dbe3-...` | `campaign-scorer-tick` ⭐ nuevo | 1h30m | isolated | agentTurn — paso 3c, status='assets_resolved' → 'scored' / 'blocked_no_assets' | Clipper |
+| `<new>` | `download-enqueue-tick` ⭐ nuevo | 10m | isolated | `venv/bin/python scripts/download_enqueue_tick.py --limit 50` — paso 7, status IN ('scored','ready') | Clipper |
 | `0f0d1264-...` | `campaign-analyze-tick` ⛔ deshabilitado | 1h30m | isolated | legacy — sustituido por 3a+3b+3c. No eliminar. | Clipper |
 | `239ee9a8-...` | `campaign-prioritizer-tick` ⛔ deshabilitado | 2h | isolated | legacy — absorbed by 3c. No eliminar. | Clipper |
 | `84f2395a-...` | `clip-decider-tick` | 1h15m | isolated | agentTurn — pasa 12-13, usa `/clip_selection/queue?priority_only=true` | Clipper |
@@ -125,6 +126,12 @@
 - **Quién**: VPS Backend.
 - **Endpoint**: `PATCH /campaigns/{id}` (antes era `POST /campaigns/{id}/spec`; ahora los crons 3a/3b/3c usan el PATCH genérico, que ya acepta `status`, `spec` y `source_metadata`).
 - **Output**: `status` y/o `spec` y/o `source_metadata` actualizados según el paso.
+
+### Paso 7 — Download enqueue (puente 3c → 8) ✅ pipeline v2
+- **Quién**: OpenClaw cron `download-enqueue-tick` (10m, isolated, command payload).
+- **Cómo**: `venv/bin/python scripts/download_enqueue_tick.py --limit 50`. Para cada campaña con `status IN ('scored','ready')` busca assets `status='pending'` con URL processable, crea 1 `download` job por campaña (idempotente: si ya hay un job `download` abierto, skip). Piggy-back: `process_pending_clip_selections` para drenar transcripciones cuyo decider nunca corrió.
+- **Por qué nuevo**: antes era `vps_pipeline_tick.py` que solo buscaba `status='ready'`. Pipeline v2 deja `scored`. Necesita su propio cron (opción 2 aprobada por Molina 2026-09-17) para no mezclar la lógica legacy con la nueva.
+- **Output**: jobs `download` encolados en `jobs` (Worker los coge via `GET /worker/jobs/next`).
 
 ### Pasos 5-7 — Asset Resolver (legacy, ya no se invoca desde paso 1) ✅
 - **Quién**: VPS Backend, función `resolve_assets_for_campaign`.

@@ -10,6 +10,7 @@ Strict rules (do not change):
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
@@ -399,6 +400,115 @@ def campaign_detail(
             "active_jobs": active_jobs,
             "clips": clips,
             "worker_file_base_url": settings.worker_file_base_url or None,
+        }
+    finally:
+        db.close()
+
+
+# --- 3b. Campaign rules (read-only, saneado para UI) ---------------------
+
+@router.get("/campaigns/{campaign_id}/rules")
+def campaign_rules(
+    campaign_id: int,
+    _a: bool = Depends(_enabled_or_404),
+    _b: bool = Depends(require_bearer),
+):
+    """Devuelve spec + source_metadata saneado para mostrar la tab 'Reglas'.
+
+    Por qué un endpoint aparte (no meter todo en /campaigns/{id}):
+    - El JSONB crudo puede ser pesado y no lo queremos en cada drill-down.
+    - Aquí normalizamos los campos que el frontend sabe pintar (rules,
+      discovered, priority_components, asset_links_brief) y los envolvemos
+    en un shape estable aunque la BD evolucione.
+    """
+    db = _get_db()
+    try:
+        row = db.execute(
+            text(
+                """
+                SELECT id, name, status, source_provider, source_url,
+                       source_metadata, spec
+                FROM campaigns
+                WHERE id = :id
+                """
+            ),
+            {"id": campaign_id},
+        ).first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+
+        sm = row.source_metadata or {}
+        discovered = sm.get("discovered") or {}
+
+        # Reglas estructuradas (puede venir {} o vacío)
+        rules = sm.get("rules") or {}
+
+        # Texto crudo del briefing (lo que el LLM vio para sacar las reglas)
+        raw = discovered.get("raw") or {}
+        card_text = raw.get("card_text") or discovered.get("description") or ""
+
+        # Links de assets que dijo el briefing que había (Drive, YouTube, etc.)
+        # — distinto de los assets ya resueltos en BD.
+        asset_links_brief = sm.get("asset_links_brief") or []
+        asset_links_raw = discovered.get("asset_links") or sm.get("asset_links") or []
+
+        # Normalizar asset_links_raw a una lista de strings simples
+        asset_links_normalized: List[str] = []
+        for item in asset_links_raw:
+            if isinstance(item, str):
+                asset_links_normalized.append(item)
+            elif isinstance(item, dict):
+                # por si vienen como {url, kind, label}
+                if item.get("url"):
+                    asset_links_normalized.append(item["url"])
+
+        # Drive IDs extraídos (lo que el resolver debería haber bajado)
+        drive_ids = []
+        for url in asset_links_normalized:
+            if "drive.google.com" in url:
+                # /file/d/<id>/ o ?id=<id>
+                m = re.search(r"/file/d/([A-Za-z0-9_-]+)", url)
+                if not m:
+                    m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", url)
+                if m:
+                    drive_ids.append(m.group(1))
+
+        # Componentes de prioridad (cómo se calculó el score)
+        priority_components = sm.get("priority_components") or {}
+
+        # Specs — el "spec" canónico. Si está vacío, marcamos explícito.
+        spec = row.spec or {}
+        spec_is_empty = (not spec) or (spec == {}) or (len(spec.keys()) == 0)
+
+        return {
+            "campaign_id": row.id,
+            "campaign_name": row.name,
+            "status": row.status,
+            "source_provider": row.source_provider,
+            "source_url": row.source_url,
+            "spec": spec,
+            "spec_is_empty": spec_is_empty,
+            "rules": rules,
+            "card_text": card_text,
+            "discovered": {
+                "name": discovered.get("name"),
+                "external_id": discovered.get("external_id"),
+                "detail_url": discovered.get("detail_url"),
+                "cpm_usd_per_1k": discovered.get("cpm_usd_per_1k"),
+                "prize_pool_usd": discovered.get("prize_pool_usd"),
+                "joined": discovered.get("joined"),
+            },
+            "asset_links_brief": asset_links_brief,
+            "asset_links_raw": asset_links_normalized,
+            "asset_links_count": len(asset_links_normalized),
+            "drive_ids": drive_ids,
+            "priority_tier": sm.get("priority_tier"),
+            "priority_score": sm.get("priority_score"),
+            "priority_components": priority_components,
+            "briefed_at": sm.get("briefed_at"),
+            "joined": sm.get("joined"),
+            "cpm_usd_per_1k": sm.get("cpm_usd_per_1k"),
+            "prize_pool_usd": sm.get("prize_pool_usd"),
         }
     finally:
         db.close()

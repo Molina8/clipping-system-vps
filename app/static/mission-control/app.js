@@ -307,11 +307,38 @@ async function renderCampaigns(main, cid) {
     <h2>Campaigns <span class="muted">(${items.length})</span></h2>
     <div class="grid">`;
   for (const c of items) {
-    html += `
-      <div class="campaign-card" data-cid="${c.id}" onclick="location.hash='#/campaigns/${c.id}'">
+    html += _campaignCardHTML(c);
+  }
+  html += "</div></div>";
+  main.innerHTML = html;
+  document.getElementById("auto-refresh-status").textContent = "off";
+}
+
+// Una sola fuente para la card de campaña. La usan el render inicial y el re-filter del search.
+function _campaignCardHTML(c) {
+  const badges = [];
+  let cardClass = "campaign-card";
+  const isBriefedOrLater = ["briefed","assets_resolved","scored","ready","active","paused","completed"].includes(c.status);
+
+  if (isBriefedOrLater && c.assets_total === 0) {
+    badges.push(`<span class="badge-err" title="briefed pero 0 assets resueltos">no assets</span>`);
+    cardClass += " has-err";
+  } else if (isBriefedOrLater && c.assets_total > 0 && c.assets_transcribed === 0) {
+    badges.push(`<span class="badge-warn" title="assets descargados pero ninguno transcrito">sin transcribir</span>`);
+    cardClass += " has-warn";
+  } else if (c.assets_total > 0 && c.assets_transcribed > 0 && c.clips_approved_qa === 0) {
+    badges.push(`<span class="badge-warn" title="hay assets transcritos pero 0 clips que pasen QA">sin clips QA</span>`);
+  }
+
+  if (["failed_brief","failed_resolve","blocked_no_assets"].includes(c.status)) {
+    cardClass += " has-err";
+  }
+
+  return `
+      <div class="${cardClass}" data-cid="${c.id}" onclick="location.hash='#/campaigns/${c.id}'">
         <h4>${esc(c.name)}</h4>
         <div class="meta">
-          <span>${pill(c.status)}</span>
+          <span>${pill(c.status)}${badges.join("")}</span>
           <span class="provider">${esc(c.source_provider)}</span>
         </div>
         <div class="counters">
@@ -320,10 +347,6 @@ async function renderCampaigns(main, cid) {
           <span class="counter">${c.clips_total} total</span>
         </div>
       </div>`;
-  }
-  html += "</div></div>";
-  main.innerHTML = html;
-  document.getElementById("auto-refresh-status").textContent = "off";
 }
 
 async function renderCampaignDetail(main, cid) {
@@ -377,6 +400,7 @@ async function renderCampaignDetail(main, cid) {
 
       <div class="tabs">
         <button data-tab="assets" class="active">Assets (${assets.length})</button>
+        <button data-tab="rules">Reglas</button>
         <button data-tab="jobs">Active jobs (${jobs.length})</button>
         <button data-tab="clips">Clips (${clips.length})</button>
       </div>
@@ -389,14 +413,156 @@ async function renderCampaignDetail(main, cid) {
       b.classList.toggle("active", b.dataset.tab === t));
     const tc = document.getElementById("tab-content");
     if (t === "assets") tc.innerHTML = renderAssetsTable(assets);
+    if (t === "rules")  tc.innerHTML = '<div class="muted" style="padding:20px;">Cargando reglas…</div>';
     if (t === "jobs")   tc.innerHTML = renderJobsTable(jobs.map(j => ({...j, campaign_name: c.name})));
     if (t === "clips")  tc.innerHTML = renderClipsTable(clips.map(cl => ({...cl, campaign_name: c.name})));
   }
+  // Carga lazy de la tab Reglas (no bloquear el drill-down)
+  let rulesLoaded = false;
+  document.querySelector('.tabs button[data-tab="rules"]').addEventListener("click", async () => {
+    if (rulesLoaded) return;
+    rulesLoaded = true;
+    try {
+      const rules = await api(`/mission-control/campaigns/${cid}/rules`);
+      const tc = document.getElementById("tab-content");
+      tc.innerHTML = renderRulesTab(rules);
+    } catch (e) {
+      rulesLoaded = false; // reintentar la próxima
+      const tc = document.getElementById("tab-content");
+      tc.innerHTML = `<div class="error">No se pudieron cargar las reglas: ${esc(e.message)}</div>`;
+    }
+  });
   document.querySelectorAll(".tabs button").forEach(b => {
     b.addEventListener("click", () => activateTab(b.dataset.tab));
   });
   activateTab("assets");
   document.getElementById("auto-refresh-status").textContent = "off";
+}
+
+// ---------- Tab Reglas ----------
+function _priorityBar(value) {
+  if (value == null) return "";
+  const pct = Math.max(0, Math.min(100, Math.round(value * 100)));
+  return `<span class="priority-bar" style="width:${Math.max(8, pct)}px;" title="${pct}%"></span>`;
+}
+
+function renderRulesTab(r) {
+  // Bloque 1: Spec canónico (lo que la BD considera "spec" oficial)
+  const specBlock = r.spec_is_empty
+    ? `<div class="empty-rules">⚠ spec vacío en BD. Las reglas reales viven en <code>source_metadata.rules</code> (más abajo) o en el <code>card_text</code> del briefing.</div>`
+    : `<pre>${esc(JSON.stringify(r.spec, null, 2))}</pre>`;
+
+  // Bloque 2: Reglas estructuradas (source_metadata.rules)
+  const rulesObj = r.rules || {};
+  const rulesEmpty = !rulesObj || Object.keys(rulesObj).length === 0;
+  let rulesContent;
+  if (rulesEmpty) {
+    rulesContent = `<div class="empty-rules">⚠ <code>source_metadata.rules</code> vacío. El briefing de esta campaña no generó reglas estructuradas.</div>`;
+  } else {
+    const chips = [];
+    if (Array.isArray(rulesObj.platforms)) {
+      rulesObj.platforms.forEach(p => chips.push(`<span class="chip platform">${esc(p)}</span>`));
+    }
+    rulesContent = `
+      ${chips.length ? `<div style="margin-bottom:8px;">${chips.join("")}</div>` : ""}
+      <pre>${esc(JSON.stringify(rulesObj, null, 2))}</pre>`;
+  }
+
+  // Bloque 3: card_text (lo que vio el LLM para sacar las reglas)
+  const cardBlock = r.card_text
+    ? `<pre>${esc(r.card_text)}</pre>`
+    : `<div class="muted">Sin <code>card_text</code> en el briefing original.</div>`;
+
+  // Bloque 4: Priority breakdown
+  const pc = r.priority_components || {};
+  const pcRows = Object.entries(pc)
+    .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${typeof v === "number" ? v.toFixed(3) : esc(String(v))}${_priorityBar(typeof v === "number" ? v : null)}</dd>`)
+    .join("");
+  const priorityBlock = r.priority_score != null
+    ? `
+        <div class="rules-kv">
+          <dt>tier</dt><dd>${esc(r.priority_tier || "—")}</dd>
+          <dt>score</dt><dd>${esc(String(r.priority_score))}${_priorityBar(r.priority_score)}</dd>
+        </div>
+        ${pcRows ? `<div class="rules-kv" style="margin-top:8px;">${pcRows}</div>` : ""}`
+    : `<div class="muted">Sin priority score (campaña aún no priorizada).</div>`;
+
+  // Bloque 5: Asset links que dijo el briefing (Drive, YouTube, TikTok…)
+  // Diferencia CLAVE vs assets reales: aquí están los links crudos, no los assets resueltos.
+  const linkItems = (r.asset_links_raw || []).map(url => {
+    let chip = `<span class="chip link">link</span>`;
+    if (/drive\.google\.com/.test(url)) chip = `<span class="chip drive">Drive</span>`;
+    else if (/youtube\.com|youtu\.be/.test(url)) chip = `<span class="chip platform">YouTube</span>`;
+    else if (/tiktok\.com/.test(url)) chip = `<span class="chip platform">TikTok</span>`;
+    else if (/instagram\.com/.test(url)) chip = `<span class="chip platform">Instagram</span>`;
+    return `<a class="asset-link" href="${esc(url)}" target="_blank" rel="noopener">${chip} ${esc(url)}</a>`;
+  }).join("");
+
+  const linksBlock = (r.asset_links_raw || []).length
+    ? linkItems
+    : `<div class="muted">El briefing no reportó asset_links para esta campaña.</div>`;
+
+  const driveBlock = (r.drive_ids || []).length
+    ? `<div class="rules-kv" style="margin-top:8px;">
+         <dt>Drive IDs</dt>
+         <dd>${r.drive_ids.map(id => `<span class="chip drive">${esc(id)}</span>`).join(" ")}</dd>
+       </div>`
+    : "";
+
+  // Bloque 6: metadata extra (briefed_at, cpm, prize…)
+  const meta = r.discovered || {};
+  const metaBlock = `
+    <div class="rules-kv">
+      <dt>status</dt><dd>${pill(r.status)}</dd>
+      <dt>provider</dt><dd>${esc(r.source_provider || "—")}</dd>
+      ${meta.detail_url ? `<dt>detail url</dt><dd><a href="${esc(meta.detail_url)}" target="_blank" rel="noopener">${esc(meta.detail_url)}</a></dd>` : ""}
+      ${meta.external_id ? `<dt>external id</dt><dd class="mono">${esc(meta.external_id)}</dd>` : ""}
+      ${meta.cpm_usd_per_1k != null ? `<dt>CPM/1k</dt><dd>$${esc(String(meta.cpm_usd_per_1k))}</dd>` : ""}
+      ${meta.prize_pool_usd != null ? `<dt>prize pool</dt><dd>$${esc(String(meta.prize_pool_usd))}</dd>` : ""}
+      ${meta.joined != null ? `<dt>joined</dt><dd>${esc(String(meta.joined))}</dd>` : ""}
+      ${r.briefed_at ? `<dt>briefed at</dt><dd class="mono">${esc(fmtDateTime(r.briefed_at))}</dd>` : ""}
+    </div>`;
+
+  // Aviso si status es "briefed" sin assets — el caso que Molina pidió revisar.
+  const briefedNoAssetsWarn = (r.status === "briefed" && (r.asset_links_count || 0) > 0)
+    ? `<div class="empty-rules" style="margin-bottom:12px;">
+        ⚠ Esta campaña está <b>briefed</b> y el briefing reportó <b>${r.asset_links_count}</b> link(s) de asset(s).
+        Si abajo en la tab <b>Assets</b> no ves ninguno resuelto, el resolver aún no ha bajado el contenido
+        (o falló). Revisa logs de <code>assets_resolver_tick</code>.
+      </div>`
+    : "";
+
+  return `
+    ${briefedNoAssetsWarn}
+    <div class="rules-section">
+      <div class="rules-block">
+        <h4>Spec canónico</h4>
+        ${specBlock}
+      </div>
+      <div class="rules-block">
+        <h4>Reglas estructuradas <span class="muted" style="font-size:10px;">(source_metadata.rules)</span></h4>
+        ${rulesContent}
+      </div>
+      <div class="rules-block full-width">
+        <h4>Briefing original <span class="muted" style="font-size:10px;">(card_text del LLM)</span></h4>
+        ${cardBlock}
+      </div>
+      <div class="rules-block">
+        <h4>Prioridad</h4>
+        ${priorityBlock}
+      </div>
+      <div class="rules-block">
+        <h4>Metadata</h4>
+        ${metaBlock}
+      </div>
+      <div class="rules-block full-width">
+        <h4>Asset links del briefing
+          <span class="muted" style="font-size:10px;">(${r.asset_links_count || 0} links · distintos de los assets ya resueltos)</span>
+        </h4>
+        ${linksBlock}
+        ${driveBlock}
+      </div>
+    </div>`;
 }
 
 function renderAssetsTable(rows) {

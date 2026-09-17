@@ -211,6 +211,73 @@ def test_jobs_recent_limit_capped(enabled_client, auth_headers):
     assert len(body["items"]) <= 500
 
 
+def test_campaign_rules_shape(enabled_client, auth_headers):
+    """Endpoint nuevo /campaigns/{id}/rules: shape estable, sanea JSONB."""
+    row = _create_campaign()
+    try:
+        r = enabled_client.get(
+            f"/mission-control/campaigns/{row[0]}/rules", headers=auth_headers
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # Keys mínimas que el frontend necesita
+        for key in (
+            "campaign_id", "campaign_name", "status",
+            "spec", "spec_is_empty", "rules", "card_text",
+            "discovered", "asset_links_brief", "asset_links_raw",
+            "asset_links_count", "drive_ids",
+            "priority_tier", "priority_score", "priority_components",
+            "briefed_at", "joined", "cpm_usd_per_1k", "prize_pool_usd",
+        ):
+            assert key in body, f"missing key in rules: {key}"
+        assert body["campaign_id"] == row[0]
+        assert body["spec_is_empty"] is True  # spec vacío recién creado
+        assert isinstance(body["asset_links_raw"], list)
+        assert isinstance(body["drive_ids"], list)
+    finally:
+        _cleanup_campaign(row[0])
+
+
+def test_campaign_rules_404_for_missing(enabled_client, auth_headers):
+    r = enabled_client.get(
+        "/mission-control/campaigns/999999999/rules", headers=auth_headers
+    )
+    assert r.status_code == 404
+
+
+def test_campaign_rules_requires_auth(enabled_client):
+    r = enabled_client.get("/mission-control/campaigns/1/rules")
+    assert r.status_code in (401, 403)
+
+
+def test_campaign_rules_drives_extraction(enabled_client, auth_headers):
+    """Si source_metadata tiene un link de Drive, debe aparecer en drive_ids."""
+    row = _create_campaign()
+    s = SessionLocal()
+    try:
+        s.execute(
+            text("UPDATE campaigns SET source_metadata = :sm WHERE id = :id"),
+            {
+                "sm": '{"asset_links": ["https://drive.google.com/file/d/1ABCxyz-_/view"], "rules": {"platforms": ["tiktok"]}}',
+                "id": row[0],
+            },
+        )
+        s.commit()
+    finally:
+        s.close()
+    try:
+        r = enabled_client.get(
+            f"/mission-control/campaigns/{row[0]}/rules", headers=auth_headers
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["asset_links_count"] == 1
+        assert "1ABCxyz-_" in body["drive_ids"]
+        assert body["rules"]["platforms"] == ["tiktok"]
+    finally:
+        _cleanup_campaign(row[0])
+
+
 # ---------------------------------------------------------------------------
 # Stricter test: no POST/PUT/PATCH/DELETE declared
 # ---------------------------------------------------------------------------
@@ -231,6 +298,7 @@ def test_no_write_verbs_in_router():
         "/mission-control/overview",
         "/mission-control/campaigns",
         "/mission-control/campaigns/{campaign_id}",
+        "/mission-control/campaigns/{campaign_id}/rules",
         "/mission-control/jobs/recent",
         "/mission-control/pipeline/{campaign_id}",
         "/mission-control/videos",

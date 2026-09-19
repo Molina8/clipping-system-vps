@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Paso 3b — expand Drive folders into file assets. No LLM."""
+"""Paso 3b — expand Drive folders into file assets. Recurse 2 levels."""
 from __future__ import annotations
 
 import argparse
@@ -12,9 +12,18 @@ from pathlib import Path
 
 ROOT = Path("/opt/clipping-system")
 sys.path.insert(0, str(ROOT))
+try:
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env")
+except Exception:
+    pass
 
 FOLDER_RE = re.compile(r"/folders/([a-zA-Z0-9_-]+)")
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+FOLDER_MIME = "application/vnd.google-apps.folder"
+SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
+MAX_DEPTH = 2
+MAX_FILES = 80
 
 
 def _folder_id(url: str) -> str | None:
@@ -37,47 +46,61 @@ def _parse_gog_json(out: str) -> list[dict]:
         return [x for x in data if isinstance(x, dict)]
     if not isinstance(data, dict):
         return []
-    for key in ("files", "items", "entries", "result", "data"):
-        val = data.get(key)
-        if isinstance(val, list):
-            return [x for x in val if isinstance(x, dict)]
-        if isinstance(val, dict):
-            inner = val.get("files") or val.get("items") or []
-            if isinstance(inner, list):
-                return [x for x in inner if isinstance(x, dict)]
-    return []
+    val = data.get("files") or data.get("items") or []
+    return [x for x in val if isinstance(x, dict)] if isinstance(val, list) else []
 
 
 def _gog_ls(folder_id: str) -> list[dict]:
     env = _gog_env()
-    attempts = [
-        ["gog", "drive", "ls", "--parent", folder_id, "--json", "--max", "100"],
-        ["gog", "ls", "--parent", folder_id, "--json", "--max", "100"],
-    ]
-    last = ""
-    for cmd in attempts:
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=90)
-        except FileNotFoundError:
-            raise RuntimeError("gog binary not found on PATH")
-        last = (p.stdout or "") + "\n" + (p.stderr or "")
-        if p.returncode != 0:
-            continue
-        out = (p.stdout or "").strip()
-        if not out:
-            continue
-        try:
-            rows = _parse_gog_json(out)
-        except json.JSONDecodeError:
-            continue
-        if rows:
-            return rows
-    raise RuntimeError(f"gog ls failed for {folder_id}: {last[:500]}")
+    cmd = ["gog", "drive", "ls", "--parent", folder_id, "--json", "--max", "100"]
+    if env.get("GOG_ACCOUNT"):
+        cmd[3:3] = ["--account", env["GOG_ACCOUNT"]]
+    p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=90)
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr or p.stdout or "gog failed")[:400])
+    return _parse_gog_json((p.stdout or "").strip() or "{}")
+
+
+def _walk(folder_id: str, depth: int, seen: set[str]) -> list[dict]:
+    if not folder_id or folder_id in seen or depth > MAX_DEPTH:
+        return []
+    seen.add(folder_id)
+    rows = _gog_ls(folder_id)
+    out = []
+    for item in rows:
+        mime = str(item.get("mimeType") or "")
+        fid = str(item.get("id") or "")
+        if mime == FOLDER_MIME and depth < MAX_DEPTH:
+            out.extend(_walk(fid, depth + 1, seen))
+        elif mime == SHORTCUT_MIME:
+            details = item.get("shortcutDetails") or {}
+            tid = details.get("targetId")
+            tmime = details.get("targetMimeType") or ""
+            if tmime == FOLDER_MIME and depth < MAX_DEPTH:
+                out.extend(_walk(str(tid), depth + 1, seen))
+            elif tid:
+                item = dict(item)
+                item["id"] = tid
+                item["mimeType"] = tmime or mime
+                out.append(item)
+        else:
+            out.append(item)
+        if len(out) >= MAX_FILES:
+            break
+    return out[:MAX_FILES]
+
+
+def _is_video(item: dict) -> bool:
+    mime = str(item.get("mimeType") or "")
+    name = str(item.get("name") or "")
+    if mime.startswith("video/"):
+        return True
+    return Path(name).suffix.lower() in VIDEO_EXT
 
 
 def _kind_from_name(name: str) -> str:
     ext = Path(name or "").suffix.lower()
-    return ext.lstrip(".") if ext in VIDEO_EXT else "file"
+    return ext.lstrip(".") if ext in VIDEO_EXT else "video"
 
 
 def _uc(file_id: str) -> str:
@@ -101,53 +124,41 @@ def main() -> int:
     try:
         camps = (
             db.query(Campaign)
-            .filter(Campaign.status.in_(("briefed", "failed_resolve")))
+            .filter(Campaign.status.in_(("briefed", "failed_resolve", "assets_resolved")))
             .order_by(Campaign.id.asc())
             .limit(args.limit)
             .all()
         )
         print(f"drive_resolver_tick scanned={len(camps)} dry_run={args.dry_run}")
         for c in camps:
-            existing_ids = {
-                a.source_id
-                for a in db.query(Asset).filter(Asset.campaign_id == c.id).all()
-                if a.source_id
-            }
-            folders = []
-            for a in db.query(Asset).filter(Asset.campaign_id == c.id).all():
-                fid = _folder_id(a.source_url or "")
-                kind = (a.extra_metadata or {}).get("kind")
-                if fid or kind == "drive_folder":
-                    folders.append(fid or _folder_id(a.source_url or ""))
+            existing = db.query(Asset).filter(Asset.campaign_id == c.id).all()
+            if c.status == "assets_resolved" and any(
+                (a.extra_metadata or {}).get("kind") not in {"drive_folder", "brand_asset"} for a in existing
+            ):
+                print(f"campaign={c.id} skip already has files")
+                continue
+            existing_ids = {a.source_id for a in existing if a.source_id}
+            roots = []
             discovered = (c.source_metadata or {}).get("discovered") or {}
             for ref in discovered.get("reference_materials") or []:
                 if isinstance(ref, dict):
                     fid = _folder_id(ref.get("url") or "")
                     if fid:
-                        folders.append(fid)
-
-            seen_f, file_rows, errors = set(), [], []
-            for fid in folders:
-                if not fid or fid in seen_f:
-                    continue
-                seen_f.add(fid)
+                        roots.append(fid)
+            seen, videos, errors = set(), [], []
+            for fid in roots:
                 try:
-                    file_rows.extend(_gog_ls(fid))
+                    videos.extend(_walk(fid, 0, seen))
                 except Exception as e:
                     errors.append(str(e))
                     print(f"campaign={c.id} folder={fid} ERROR {e}")
-
             new_assets = 0
-            for item in file_rows:
-                fid = str(item.get("id") or item.get("Id") or "")
-                name = str(item.get("name") or item.get("Name") or fid)
-                mime = str(item.get("mimeType") or item.get("mime") or "")
-                if not fid or "folder" in mime.lower():
+            for item in videos:
+                if not _is_video(item):
                     continue
-                kind = _kind_from_name(name)
-                if kind == "file" and not str(mime).startswith("video/"):
-                    continue
-                if fid in existing_ids:
+                fid = str(item.get("id") or "")
+                name = str(item.get("name") or fid)
+                if not fid or fid in existing_ids:
                     continue
                 print(f"campaign={c.id} file={fid} name={name}")
                 if args.dry_run:
@@ -162,9 +173,9 @@ def main() -> int:
                         source_provider="gdrive",
                         asset_type="video",
                         extra_metadata={
-                            "kind": kind,
+                            "kind": _kind_from_name(name),
                             "name": name,
-                            "mime_type": mime or f"video/{kind}",
+                            "mime_type": item.get("mimeType") or "video/mp4",
                             "discovered_by": "drive_resolver_tick",
                         },
                     ),
@@ -172,17 +183,20 @@ def main() -> int:
                 existing_ids.add(fid)
                 new_assets += 1
                 created += 1
-
-            if errors and new_assets == 0:
+                if new_assets >= MAX_FILES:
+                    break
+            if new_assets == 0:
                 if not args.dry_run:
-                    c.status = "failed_resolve"
+                    c.status = "failed_resolve" if errors else "blocked_no_assets"
                     meta = dict(c.source_metadata or {})
-                    meta["resolve_error"] = {"kind": "drive_auth_or_gog", "message": errors[0][:300]}
+                    meta["resolve_error"] = {
+                        "kind": "no_videos" if not errors else "gog",
+                        "message": (errors[0] if errors else "folder had no video files")[:300],
+                    }
                     c.source_metadata = meta
                     db.commit()
-                print(f"campaign={c.id} -> failed_resolve")
+                print(f"campaign={c.id} new_files=0 status={c.status}")
                 continue
-
             if not args.dry_run:
                 c.status = "assets_resolved"
                 meta = dict(c.source_metadata or {})

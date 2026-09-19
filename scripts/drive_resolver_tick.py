@@ -107,6 +107,31 @@ def _uc(file_id: str) -> str:
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
 
+def _candidate_urls(campaign) -> list[str]:
+    meta = campaign.source_metadata or {}
+    urls: list[str] = []
+    for u in meta.get("asset_links") or []:
+        if isinstance(u, str):
+            urls.append(u)
+    rules = meta.get("rules") or {}
+    for u in rules.get("content_source_urls") or []:
+        if isinstance(u, str):
+            urls.append(u)
+    discovered = meta.get("discovered") or {}
+    for ref in discovered.get("reference_materials") or []:
+        if isinstance(ref, dict) and ref.get("url"):
+            urls.append(ref["url"])
+        elif isinstance(ref, str):
+            urls.append(ref)
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--limit", type=int, default=1)
@@ -131,6 +156,19 @@ def main() -> int:
         )
         print(f"drive_resolver_tick scanned={len(camps)} dry_run={args.dry_run}")
         for c in camps:
+            meta = dict(c.source_metadata or {})
+            rules = dict(meta.get("rules") or {})
+            if rules.get("unsupported_video_host"):
+                print(f"campaign={c.id} skip unsupported_video_host")
+                if not args.dry_run:
+                    c.status = "blocked_no_assets"
+                    meta["resolve_error"] = {
+                        "kind": "unsupported_host",
+                        "message": "footage is not Google Drive (e.g. MediaSilo); 3b cannot list it",
+                    }
+                    c.source_metadata = meta
+                    db.commit()
+                continue
             existing = db.query(Asset).filter(Asset.campaign_id == c.id).all()
             if c.status == "assets_resolved" and any(
                 (a.extra_metadata or {}).get("kind") not in {"drive_folder", "brand_asset"} for a in existing
@@ -138,13 +176,21 @@ def main() -> int:
                 print(f"campaign={c.id} skip already has files")
                 continue
             existing_ids = {a.source_id for a in existing if a.source_id}
+            urls = _candidate_urls(c)
             roots = []
-            discovered = (c.source_metadata or {}).get("discovered") or {}
-            for ref in discovered.get("reference_materials") or []:
-                if isinstance(ref, dict):
-                    fid = _folder_id(ref.get("url") or "")
-                    if fid:
-                        roots.append(fid)
+            for url in urls:
+                fid = _folder_id(url)
+                if fid and fid not in roots:
+                    roots.append(fid)
+            if not roots:
+                msg = "no Google Drive folder in brief/refs: " + ", ".join(urls[:5])
+                print(f"campaign={c.id} {msg}")
+                if not args.dry_run:
+                    c.status = "blocked_no_assets"
+                    meta["resolve_error"] = {"kind": "no_drive_folder", "message": msg[:300]}
+                    c.source_metadata = meta
+                    db.commit()
+                continue
             seen, videos, errors = set(), [], []
             for fid in roots:
                 try:
@@ -188,10 +234,9 @@ def main() -> int:
             if new_assets == 0:
                 if not args.dry_run:
                     c.status = "failed_resolve" if errors else "blocked_no_assets"
-                    meta = dict(c.source_metadata or {})
                     meta["resolve_error"] = {
-                        "kind": "no_videos" if not errors else "gog",
-                        "message": (errors[0] if errors else "folder had no video files")[:300],
+                        "kind": "gog" if errors else "empty_drive_folder",
+                        "message": (errors[0] if errors else "Drive folder listed but contained no video files")[:300],
                     }
                     c.source_metadata = meta
                     db.commit()
@@ -199,7 +244,6 @@ def main() -> int:
                 continue
             if not args.dry_run:
                 c.status = "assets_resolved"
-                meta = dict(c.source_metadata or {})
                 meta["resolve_error"] = None
                 c.source_metadata = meta
                 db.commit()

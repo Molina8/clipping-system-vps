@@ -5,12 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Clipping · Mission Control</title>
 <link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="mc-v25.css">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 </head>
 <body>
-<!-- BEGIN: TopBar (Stitch) -->
 <header class="mc-topbar">
   <div class="mc-topbar-inner">
     <div class="mc-brand">
@@ -36,11 +36,7 @@
     </div>
   </div>
 </header>
-<!-- END: TopBar -->
-
-<!-- BEGIN: MainLayoutContainer -->
 <div class="mc-layout">
-  <!-- BEGIN: LeftSidebar (Stitch) -->
   <aside class="mc-sidebar">
     <div class="mc-sidebar-inner">
       <div>
@@ -110,16 +106,10 @@
       </div>
     </div>
   </aside>
-  <!-- END: LeftSidebar -->
-
-  <!-- BEGIN: MainContent -->
   <main id="main" class="mc-main">
     <div class="mc-empty-page">Pick a section on the left.</div>
   </main>
-  <!-- END: MainContent -->
 </div>
-<!-- END: MainLayoutContainer -->
-
 <div id="modal" class="modal hidden" role="dialog" aria-modal="true">
   <div class="modal-backdrop"></div>
   <div class="modal-content">
@@ -127,11 +117,10 @@
     <div id="modal-body"></div>
   </div>
 </div>
-
 <footer class="mc-footer">
   <span>Last update: <span id="last-update">—</span></span>
 </footer>
-
 <script src="app.js"></script>
+<script src="mc-v25.js"></script>
 </body>
 </html>

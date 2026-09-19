@@ -2,14 +2,10 @@
 """Paso 3c — campaign scorer. Deterministic. No LLM. No OpenClaw.
 
 Reads campaigns in assets_resolved, counts real video assets, writes score,
-sets status scored | blocked_no_assets.
+sets status scored | blocked_no_assets. Score < 50 → blocked_no_assets.
 
     python scripts/campaign_scorer_tick.py --dry-run
     python scripts/campaign_scorer_tick.py --limit 1
-
-Systemd (VPS):
-    [Timer] OnUnitActiveSec=5min
-    [Service] ExecStart=/opt/clipping-system/venv/bin/python /opt/clipping-system/scripts/campaign_scorer_tick.py --limit 5
 """
 from __future__ import annotations
 
@@ -60,16 +56,6 @@ def _cpm_usd(meta: dict) -> float:
     return best
 
 
-def _score(real_assets: int, cpm: float, prize: float, verified: bool) -> float:
-    s = 15.0
-    s += min(real_assets, 12) * 4.0
-    s += min(cpm, 10.0) * 4.0
-    s += min(prize / 10000.0, 20.0)
-    if verified:
-        s += 8.0
-    return round(min(100.0, max(0.0, s)), 2)
-
-
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--limit", type=int, default=5)
@@ -79,6 +65,7 @@ def main() -> int:
     from app.db.database import SessionLocal
     from app.models.campaign import Campaign
     from app.models.asset import Asset
+    from app.services.campaign_score import MIN_SCORE_TO_RUN, score_campaign
 
     db = SessionLocal()
     changed = 0
@@ -96,17 +83,31 @@ def main() -> int:
             real = [a for a in assets if _is_real_asset(a)]
             meta = dict(c.source_metadata or {})
             discovered = dict(meta.get("discovered") or {})
+            rules = dict(meta.get("rules") or {})
             cpm = _cpm_usd(meta)
             try:
                 prize = float(discovered.get("prize_pool_usd") or 0)
             except (TypeError, ValueError):
                 prize = 0.0
             verified = bool(discovered.get("organization_verified"))
-            score = _score(len(real), cpm, prize, verified)
-            new_status = "scored" if real else "blocked_no_assets"
+            scored = score_campaign(
+                real_assets=len(real),
+                cpm=cpm,
+                prize=prize,
+                verified=verified,
+                rules=rules,
+                content_kinds=rules.get("content_source_kinds"),
+            )
+            score = scored["value"]
+            if not real:
+                new_status = "blocked_no_assets"
+            elif score < MIN_SCORE_TO_RUN or not scored["eligible"]:
+                new_status = "blocked_no_assets"
+            else:
+                new_status = "scored"
             print(
                 f"campaign={c.id} real_assets={len(real)} cpm={cpm} "
-                f"prize={prize} score={score} -> {new_status}"
+                f"prize={prize} score={score} pen={scored['penalties']} -> {new_status}"
             )
             if args.dry_run:
                 continue
@@ -114,6 +115,7 @@ def main() -> int:
             spec = dict(c.spec or {})
             extra = dict(spec.get("extra") or {})
             extra["score"] = score
+            extra["score_breakdown"] = scored
             extra["scored_at"] = datetime.now(timezone.utc).isoformat()
             extra["real_assets"] = len(real)
             spec["extra"] = extra
@@ -123,6 +125,7 @@ def main() -> int:
                 "real_assets": len(real),
                 "cpm_usd": cpm,
                 "prize_pool_usd": prize,
+                "breakdown": scored,
             }
             c.source_metadata = meta
             c.status = new_status

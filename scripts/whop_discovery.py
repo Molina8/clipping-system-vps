@@ -1,35 +1,11 @@
 #!/usr/bin/env python3
-"""Whop discovery cron entrypoint — invoked by OpenClaw cron `whop-discovery-cron`.
+"""Paso 0 — Whop discovery. Inserta solo si hay hueco bajo MAX_ACTIVE.
 
-Standalone script (no FastAPI context) so the OpenClaw scheduler can run it
-as a `command` payload with a working directory of `/opt/clipping-system`.
+Activas = discovered | briefed | assets_resolved | scored | ready.
+Fallidas / bloqueadas no cuentan. Ya existentes se ignoran (no consumen hueco).
 
-What it does (architecture_flow.md step 1 — pipeline v2, 2026-09-17):
-  1. Discover campaigns from the Whop public JSON API.
-  2. Upsert into `campaigns` (representative names: "[whop] $X/1k · $Yk · Name").
-     ONLY basic fields: name, cpm_usd_per_1k, prize_pool_usd, source_url,
-     source_instructions (raw brief text), source_provider='whop'.
-     status='discovered'. NO assets. NO spec. NO analysis.
-
-Pipeline v2: paso 3 is split into 3a (brief-reader-tick), 3b (drive-resolver-tick)
-and 3c (campaign-scorer-tick). Each of those crons picks up campaigns in the
-right status and writes its own piece. This script must NOT do any of that.
-
-Output policy (kept tight to avoid spamming Telegram):
-  - Logs go to `/opt/clipping-system/logs/whop_discovery.log`.
-  - Stderr is silenced on success.
-  - Stdout emits a single short line ONLY when there's something to report:
-    * new campaigns upserted, OR
-    * error.
-    No-op runs (everything already up to date) print nothing and exit 0,
-    so the cron announces no message to Telegram.
-
-Usage:
-    cd /opt/clipping-system
-    source venv/bin/activate
-    python scripts/whop_discovery.py                # full sweep (limit=50)
-    python scripts/whop_discovery.py --limit 10     # smaller sweep
-    python scripts/whop_discovery.py --dry-run      # discover + report only, no DB writes
+    python scripts/whop_discovery.py --no-fetch-detail --max-active 3
+    python scripts/whop_discovery.py --dry-run --no-fetch-detail
 """
 from __future__ import annotations
 
@@ -43,21 +19,32 @@ from pathlib import Path
 ROOT = Path("/opt/clipping-system")
 sys.path.insert(0, str(ROOT))
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env")
+except Exception:
+    pass
+
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
-
 logging.basicConfig(
     level=os.environ.get("WHOP_DISCOVERY_LOG_LEVEL", "INFO"),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_DIR / "whop_discovery.log"),
-    ],
+    handlers=[logging.FileHandler(LOG_DIR / "whop_discovery.log")],
 )
 logger = logging.getLogger("whop_discovery")
 
+ACTIVE_STATUSES = (
+    "discovered",
+    "briefed",
+    "assets_resolved",
+    "scored",
+    "ready",
+)
+DEFAULT_MAX_ACTIVE = int(os.environ.get("DISCOVERY_MAX_ACTIVE", "3"))
+
 
 def _build_whop_provider():
-    """Return a WhopProvider instance configured from env (or registry fallback)."""
     from app.services.discovery.providers.whop import WhopProvider
     from app.services.discovery.registry import get_provider
 
@@ -65,29 +52,46 @@ def _build_whop_provider():
         "WHOP_TENANT_URL",
         "https://b4e0vdqv6zgqeqj4pfgm.apps.whop.com",
     )
-    # Try registry first (respects multi-tenant config), but construct
-    # directly with the env-overridden tenant so this script can target
-    # a specific tenant without changing code.
     registered = get_provider("whop")
     if registered is not None and getattr(registered, "tenant_url", None) == tenant:
         return registered
     return WhopProvider(tenant_url=tenant)
 
 
+def _active_count(db) -> int:
+    from app.models.campaign import Campaign
+
+    return (
+        db.query(Campaign)
+        .filter(Campaign.status.in_(ACTIVE_STATUSES))
+        .count()
+    )
+
+
+def _already_known(db, detail_url: str) -> bool:
+    from app.models.campaign import Campaign
+
+    if not detail_url:
+        return False
+    return (
+        db.query(Campaign.id)
+        .filter(Campaign.source_url == detail_url)
+        .first()
+        is not None
+    )
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Whop discovery cron entrypoint")
-    p.add_argument("--limit", type=int, default=50, help="max campaigns per run")
+    p.add_argument("--limit", type=int, default=10, help="max cards to fetch from Whop")
+    p.add_argument("--max-active", type=int, default=DEFAULT_MAX_ACTIVE)
     p.add_argument(
         "--fetch-detail",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="fetch detail page for each card (slower, more data)",
+        default=False,
+        help="fetch_detail is broken; default off",
     )
-    p.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="discover only, don't touch the DB",
-    )
+    p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
     from app.db.database import SessionLocal
@@ -97,29 +101,40 @@ def main() -> int:
         "provider": "whop",
         "discovered": 0,
         "upserted": 0,
-        "assets_created": 0,
+        "skipped_full": 0,
+        "skipped_existing": 0,
+        "active": 0,
+        "slots": 0,
         "campaigns": [],
         "dry_run": args.dry_run,
         "limit": args.limit,
+        "max_active": args.max_active,
     }
     try:
+        active = _active_count(db)
+        slots = max(0, args.max_active - active)
+        summary["active"] = active
+        summary["slots"] = slots
+        if slots == 0:
+            logger.info("discovery skip: active=%s max=%s", active, args.max_active)
+            print(json.dumps(summary))
+            return 0
+
         provider = _build_whop_provider()
         try:
-            discovered = provider.discover(limit=args.limit)
-        except Exception as e:  # noqa: BLE001
+            discovered = provider.discover(limit=max(args.limit, 3))
+        except Exception as e:
             logger.exception("whop discover failed: %s", e)
             summary["error"] = f"discover_failed: {e}"
             print(json.dumps(summary))
             return 2
 
         summary["discovered"] = len(discovered)
-        logger.info("whop discover returned %d campaigns", len(discovered))
-
         if args.fetch_detail:
             for d in discovered:
                 try:
                     provider.fetch_detail(d)
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     logger.info("fetch_detail failed for %s: %s", d.external_id, e)
 
         if args.dry_run:
@@ -129,6 +144,7 @@ def main() -> int:
                     "cpm": d.cpm_usd_per_1k,
                     "prize_pool_usd": d.prize_pool_usd,
                     "detail_url": d.detail_url,
+                    "known": _already_known(db, d.detail_url),
                 }
                 for d in discovered
             ]
@@ -137,10 +153,14 @@ def main() -> int:
 
         from app.services.discovery.upsert import upsert_campaign
 
-        # Pipeline v2: minimal upsert only. No assets, no analyze.
-        # Asset resolution and brief scoring live in crons 3a/3b/3c.
         upserted = 0
         for d in discovered:
+            if _already_known(db, d.detail_url):
+                summary["skipped_existing"] += 1
+                continue
+            if upserted >= slots:
+                summary["skipped_full"] += 1
+                continue
             c = upsert_campaign(db, d, status="discovered")
             upserted += 1
             summary["campaigns"].append(
@@ -148,15 +168,15 @@ def main() -> int:
             )
 
         summary["upserted"] = upserted
-        summary["assets_created"] = 0
-
+        summary["active"] = _active_count(db)
+        summary["slots"] = max(0, args.max_active - summary["active"])
         print(json.dumps(summary))
         logger.info(
             "whop_discovery done: %s",
             {k: v for k, v in summary.items() if k != "campaigns"},
         )
         return 0
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.exception("whop_discovery failed: %s", e)
         summary["error"] = f"{type(e).__name__}: {e}"
         print(json.dumps(summary))

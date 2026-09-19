@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Paso 3b — expand Drive folders into file assets. Recurse 2 levels."""
+"""Paso 3b — expand Drive folders or MediaSilo reviews into file assets."""
 from __future__ import annotations
 
 import argparse
@@ -23,7 +23,7 @@ VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 MAX_DEPTH = 2
-MAX_FILES = 80
+MAX_FILES = 12
 
 
 def _folder_id(url: str) -> str | None:
@@ -132,9 +132,29 @@ def _candidate_urls(campaign) -> list[str]:
     return out
 
 
+def _resolve_mediasilo(urls: list[str]) -> list[dict]:
+    from app.services.mediasilo import list_review, parse_review_url
+    found: list[dict] = []
+    seen: set[str] = set()
+    for url in urls:
+        parsed = parse_review_url(url)
+        if not parsed:
+            continue
+        rid, fid = parsed
+        key = f"{rid}/{fid or ''}"
+        if key in seen:
+            continue
+        seen.add(key)
+        found.extend(list_review(rid, fid))
+        if len(found) >= MAX_FILES:
+            break
+    return found[:MAX_FILES]
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--limit", type=int, default=1)
+    p.add_argument("--campaign-id", type=int, default=None)
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -147,31 +167,20 @@ def main() -> int:
     db = SessionLocal()
     created = resolved = 0
     try:
-        camps = (
-            db.query(Campaign)
-            .filter(Campaign.status.in_(("briefed", "failed_resolve", "assets_resolved")))
-            .order_by(Campaign.id.asc())
-            .limit(args.limit)
-            .all()
-        )
+        q = db.query(Campaign)
+        if args.campaign_id:
+            camps = q.filter(Campaign.id == args.campaign_id).all()
+        else:
+            camps = (
+                q.filter(Campaign.status.in_(("briefed", "failed_resolve", "assets_resolved")))
+                .order_by(Campaign.id.asc())
+                .limit(args.limit)
+                .all()
+            )
         print(f"drive_resolver_tick scanned={len(camps)} dry_run={args.dry_run}")
         for c in camps:
             meta = dict(c.source_metadata or {})
-            rules = dict(meta.get("rules") or {})
             urls = _candidate_urls(c)
-            roots = []
-            for url in urls:
-                fid = _folder_id(url)
-                if fid and fid not in roots:
-                    roots.append(fid)
-            if not roots:
-                msg = "no Google Drive folder in brief/refs: " + ", ".join(urls[:5])
-                print(f"campaign={c.id} skip {msg}")
-                if not args.dry_run:
-                    meta["resolve_error"] = {"kind": "no_drive_folder", "message": msg[:300]}
-                    c.source_metadata = meta
-                    db.commit()
-                continue
             existing = db.query(Asset).filter(Asset.campaign_id == c.id).all()
             if c.status == "assets_resolved" and any(
                 (a.extra_metadata or {}).get("kind") not in {"drive_folder", "brand_asset"} for a in existing
@@ -179,52 +188,100 @@ def main() -> int:
                 print(f"campaign={c.id} skip already has files")
                 continue
             existing_ids = {a.source_id for a in existing if a.source_id}
-            seen, videos, errors = set(), [], []
-            for fid in roots:
-                try:
-                    videos.extend(_walk(fid, 0, seen))
-                except Exception as e:
-                    errors.append(str(e))
-                    print(f"campaign={c.id} folder={fid} ERROR {e}")
+            roots = []
+            for url in urls:
+                fid = _folder_id(url)
+                if fid and fid not in roots:
+                    roots.append(fid)
+
             new_assets = 0
-            for item in videos:
-                if not _is_video(item):
-                    continue
-                fid = str(item.get("id") or "")
-                name = str(item.get("name") or fid)
-                if not fid or fid in existing_ids:
-                    continue
-                print(f"campaign={c.id} file={fid} name={name}")
-                if args.dry_run:
+            errors: list[str] = []
+
+            if roots:
+                seen, videos = set(), []
+                for fid in roots:
+                    try:
+                        videos.extend(_walk(fid, 0, seen))
+                    except Exception as e:
+                        errors.append(str(e))
+                        print(f"campaign={c.id} folder={fid} ERROR {e}")
+                for item in videos:
+                    if not _is_video(item):
+                        continue
+                    fid = str(item.get("id") or "")
+                    name = str(item.get("name") or fid)
+                    if not fid or fid in existing_ids:
+                        continue
+                    print(f"campaign={c.id} drive file={fid} name={name}")
+                    if args.dry_run:
+                        new_assets += 1
+                        continue
+                    create_asset(
+                        db,
+                        AssetCreate(
+                            campaign_id=c.id,
+                            source_url=_uc(fid),
+                            source_id=fid,
+                            source_provider="gdrive",
+                            asset_type="video",
+                            extra_metadata={
+                                "kind": _kind_from_name(name),
+                                "name": name,
+                                "mime_type": item.get("mimeType") or "video/mp4",
+                                "discovered_by": "drive_resolver_tick",
+                            },
+                        ),
+                    )
+                    existing_ids.add(fid)
                     new_assets += 1
-                    continue
-                create_asset(
-                    db,
-                    AssetCreate(
-                        campaign_id=c.id,
-                        source_url=_uc(fid),
-                        source_id=fid,
-                        source_provider="gdrive",
-                        asset_type="video",
-                        extra_metadata={
-                            "kind": _kind_from_name(name),
-                            "name": name,
-                            "mime_type": item.get("mimeType") or "video/mp4",
-                            "discovered_by": "drive_resolver_tick",
-                        },
-                    ),
-                )
-                existing_ids.add(fid)
-                new_assets += 1
-                created += 1
-                if new_assets >= MAX_FILES:
-                    break
+                    created += 1
+                    if new_assets >= MAX_FILES:
+                        break
+            else:
+                try:
+                    ms_items = _resolve_mediasilo(urls)
+                except Exception as e:
+                    ms_items = []
+                    errors.append(str(e))
+                    print(f"campaign={c.id} mediasilo ERROR {e}")
+                else:
+                    print(f"campaign={c.id} mediasilo listed={len(ms_items)}")
+                for item in ms_items:
+                    aid = item["id"]
+                    if aid in existing_ids:
+                        continue
+                    print(f"campaign={c.id} mediasilo file={aid} name={item['name']} size={item.get('file_size')}")
+                    if args.dry_run:
+                        new_assets += 1
+                        continue
+                    create_asset(
+                        db,
+                        AssetCreate(
+                            campaign_id=c.id,
+                            source_url=item["source_url"],
+                            source_id=aid,
+                            source_provider="mediasilo",
+                            asset_type="video",
+                            extra_metadata={
+                                "kind": "video",
+                                "name": item["name"],
+                                "file_size": item.get("file_size"),
+                                "discovered_by": "mediasilo_resolver",
+                            },
+                        ),
+                    )
+                    existing_ids.add(aid)
+                    new_assets += 1
+                    created += 1
+                    if new_assets >= MAX_FILES:
+                        break
+
             if new_assets == 0:
                 if not args.dry_run:
                     c.status = "failed_resolve" if errors else "blocked_no_assets"
                     meta["resolve_error"] = {
-                        "kind": "gog" if errors else "empty_drive_folder",
-                        "message": (errors[0] if errors else "Drive folder listed but contained no video files")[:300],
+                        "kind": "resolver" if errors else "no_videos",
+                        "message": (errors[0] if errors else "no ingestible videos in Drive or MediaSilo")[:300],
                     }
                     c.source_metadata = meta
                     db.commit()

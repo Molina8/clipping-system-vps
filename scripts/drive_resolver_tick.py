@@ -158,14 +158,17 @@ def main() -> int:
         for c in camps:
             meta = dict(c.source_metadata or {})
             rules = dict(meta.get("rules") or {})
-            if rules.get("unsupported_video_host"):
-                print(f"campaign={c.id} skip unsupported_video_host")
+            urls = _candidate_urls(c)
+            roots = []
+            for url in urls:
+                fid = _folder_id(url)
+                if fid and fid not in roots:
+                    roots.append(fid)
+            if not roots:
+                msg = "no Google Drive folder in brief/refs: " + ", ".join(urls[:5])
+                print(f"campaign={c.id} skip {msg}")
                 if not args.dry_run:
-                    c.status = "blocked_no_assets"
-                    meta["resolve_error"] = {
-                        "kind": "unsupported_host",
-                        "message": "footage is not Google Drive (e.g. MediaSilo); 3b cannot list it",
-                    }
+                    meta["resolve_error"] = {"kind": "no_drive_folder", "message": msg[:300]}
                     c.source_metadata = meta
                     db.commit()
                 continue
@@ -176,21 +179,6 @@ def main() -> int:
                 print(f"campaign={c.id} skip already has files")
                 continue
             existing_ids = {a.source_id for a in existing if a.source_id}
-            urls = _candidate_urls(c)
-            roots = []
-            for url in urls:
-                fid = _folder_id(url)
-                if fid and fid not in roots:
-                    roots.append(fid)
-            if not roots:
-                msg = "no Google Drive folder in brief/refs: " + ", ".join(urls[:5])
-                print(f"campaign={c.id} {msg}")
-                if not args.dry_run:
-                    c.status = "blocked_no_assets"
-                    meta["resolve_error"] = {"kind": "no_drive_folder", "message": msg[:300]}
-                    c.source_metadata = meta
-                    db.commit()
-                continue
             seen, videos, errors = set(), [], []
             for fid in roots:
                 try:

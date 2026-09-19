@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Paso 3b — expand Drive folders into file assets. No LLM.
-
-Needs `gog` on the VPS (same tool the brief fallback used).
-
-    python scripts/drive_resolver_tick.py --dry-run
-    python scripts/drive_resolver_tick.py --limit 1
-"""
+"""Paso 3b — expand Drive folders into file assets. No LLM."""
 from __future__ import annotations
 
 import argparse
@@ -20,7 +14,6 @@ ROOT = Path("/opt/clipping-system")
 sys.path.insert(0, str(ROOT))
 
 FOLDER_RE = re.compile(r"/folders/([a-zA-Z0-9_-]+)")
-FILE_RE = re.compile(r"(?:/d/|id=)([a-zA-Z0-9_-]{20,})")
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 
 
@@ -31,51 +24,55 @@ def _folder_id(url: str) -> str | None:
 
 def _gog_env() -> dict:
     env = dict(os.environ)
-    pw = env.get("GOG_KEYRING_PASSWORD")
-    if not pw and Path("/etc/openclaw/cron-secrets.env").exists():
+    if not env.get("GOG_KEYRING_PASSWORD") and Path("/etc/openclaw/cron-secrets.env").exists():
         for line in Path("/etc/openclaw/cron-secrets.env").read_text().splitlines():
             if line.startswith("GOG_KEYRING_PASSWORD="):
                 env["GOG_KEYRING_PASSWORD"] = line.split("=", 1)[1].strip().strip('"')
     return env
 
 
+def _parse_gog_json(out: str) -> list[dict]:
+    data = json.loads(out)
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if not isinstance(data, dict):
+        return []
+    for key in ("files", "items", "entries", "result", "data"):
+        val = data.get(key)
+        if isinstance(val, list):
+            return [x for x in val if isinstance(x, dict)]
+        if isinstance(val, dict):
+            inner = val.get("files") or val.get("items") or []
+            if isinstance(inner, list):
+                return [x for x in inner if isinstance(x, dict)]
+    return []
+
+
 def _gog_ls(folder_id: str) -> list[dict]:
     env = _gog_env()
     attempts = [
-        ["gog", "drive", "ls", "--id", folder_id, "--json"],
-        ["gog", "drive", "list", "--id", folder_id, "--json"],
-        ["gog", "drive", "ls", folder_id],
+        ["gog", "drive", "ls", "--parent", folder_id, "--json", "--max", "100"],
+        ["gog", "ls", "--parent", folder_id, "--json", "--max", "100"],
     ]
     last = ""
     for cmd in attempts:
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
+            p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=90)
         except FileNotFoundError:
             raise RuntimeError("gog binary not found on PATH")
         last = (p.stdout or "") + "\n" + (p.stderr or "")
         if p.returncode != 0:
             continue
-        out = p.stdout.strip()
+        out = (p.stdout or "").strip()
         if not out:
             continue
         try:
-            data = json.loads(out)
+            rows = _parse_gog_json(out)
         except json.JSONDecodeError:
-            rows = []
-            for line in out.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                fid = parts[0] if parts else ""
-                name = parts[-1] if len(parts) > 1 else fid
-                rows.append({"id": fid, "name": name, "mimeType": ""})
+            continue
+        if rows:
             return rows
-        if isinstance(data, dict):
-            data = data.get("files") or data.get("items") or data.get("entries") or []
-        if isinstance(data, list):
-            return [x for x in data if isinstance(x, dict)]
-    raise RuntimeError(f"gog ls failed for {folder_id}: {last[:400]}")
+    raise RuntimeError(f"gog ls failed for {folder_id}: {last[:500]}")
 
 
 def _kind_from_name(name: str) -> str:
@@ -100,12 +97,11 @@ def main() -> int:
     from app.services.asset_service import create_asset
 
     db = SessionLocal()
-    created = 0
-    resolved = 0
+    created = resolved = 0
     try:
         camps = (
             db.query(Campaign)
-            .filter(Campaign.status == "briefed")
+            .filter(Campaign.status.in_(("briefed", "failed_resolve")))
             .order_by(Campaign.id.asc())
             .limit(args.limit)
             .all()
@@ -113,28 +109,25 @@ def main() -> int:
         print(f"drive_resolver_tick scanned={len(camps)} dry_run={args.dry_run}")
         for c in camps:
             existing_ids = {
-                a.source_id for a in db.query(Asset).filter(Asset.campaign_id == c.id).all() if a.source_id
+                a.source_id
+                for a in db.query(Asset).filter(Asset.campaign_id == c.id).all()
+                if a.source_id
             }
             folders = []
             for a in db.query(Asset).filter(Asset.campaign_id == c.id).all():
                 fid = _folder_id(a.source_url or "")
                 kind = (a.extra_metadata or {}).get("kind")
                 if fid or kind == "drive_folder":
-                    folders.append((fid or _folder_id(a.source_url or ""), a))
-            meta = c.source_metadata or {}
-            discovered = meta.get("discovered") or {}
+                    folders.append(fid or _folder_id(a.source_url or ""))
+            discovered = (c.source_metadata or {}).get("discovered") or {}
             for ref in discovered.get("reference_materials") or []:
-                if not isinstance(ref, dict):
-                    continue
-                url = ref.get("url") or ""
-                fid = _folder_id(url)
-                if fid:
-                    folders.append((fid, None))
+                if isinstance(ref, dict):
+                    fid = _folder_id(ref.get("url") or "")
+                    if fid:
+                        folders.append(fid)
 
-            seen_f = set()
-            file_rows = []
-            errors = []
-            for fid, _parent in folders:
+            seen_f, file_rows, errors = set(), [], []
+            for fid in folders:
                 if not fid or fid in seen_f:
                     continue
                 seen_f.add(fid)
@@ -149,12 +142,10 @@ def main() -> int:
                 fid = str(item.get("id") or item.get("Id") or "")
                 name = str(item.get("name") or item.get("Name") or fid)
                 mime = str(item.get("mimeType") or item.get("mime") or "")
-                if not fid:
-                    continue
-                if "folder" in mime.lower():
+                if not fid or "folder" in mime.lower():
                     continue
                 kind = _kind_from_name(name)
-                if kind == "file" and not mime.startswith("video/"):
+                if kind == "file" and not str(mime).startswith("video/"):
                     continue
                 if fid in existing_ids:
                     continue
@@ -193,16 +184,13 @@ def main() -> int:
                 continue
 
             if not args.dry_run:
-                for a in db.query(Asset).filter(Asset.campaign_id == c.id).all():
-                    if (a.extra_metadata or {}).get("kind") == "drive_folder" or _folder_id(a.source_url or ""):
-                        meta_a = dict(a.extra_metadata or {})
-                        meta_a["skip_download"] = True
-                        a.extra_metadata = meta_a
                 c.status = "assets_resolved"
+                meta = dict(c.source_metadata or {})
+                meta["resolve_error"] = None
+                c.source_metadata = meta
                 db.commit()
                 resolved += 1
             print(f"campaign={c.id} new_files={new_assets} -> assets_resolved")
-
         print(f"drive_resolver_tick created={created} resolved={resolved}")
         return 0
     except Exception as e:

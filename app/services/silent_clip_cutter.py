@@ -1,8 +1,4 @@
-"""Duration-only clip windows for assets without usable speech.
-
-Called from on_transcribe_completed. Creates pending candidates only.
-Does not approve / render — that stays an explicit step.
-"""
+"""Duration-only clip windows for assets without usable speech."""
 from __future__ import annotations
 
 import logging
@@ -14,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.models.asset import Asset
 from app.models.campaign import Campaign
 from app.models.candidate import Candidate
+from app.models.job import Job
 
 logger = logging.getLogger(__name__)
 
@@ -107,23 +104,26 @@ def windows(duration: float, dmin: float, dmax: float, file_size) -> list[tuple[
         if size >= MIN_BYTES_FOR_UNKNOWN_DURATION:
             return [(0.0, round(dmax, 2))]
         return []
-    target = min(dmax, max(dmin, min(dmax, duration)))
-    if duration <= dmin + 1:
+    if duration <= dmax:
         return [(0.0, round(duration, 2))]
-    first = (0.0, round(min(target, duration), 2))
-    start2 = max(0.0, duration * 0.45)
-    end2 = min(duration, start2 + target)
-    if end2 - start2 < dmin * 0.8 or abs(start2 - first[0]) < 3:
+    first = (0.0, round(dmax, 2))
+    start2 = max(dmax * 0.9, duration * 0.45)
+    end2 = min(duration, start2 + dmax)
+    if end2 - start2 < dmin or abs(start2 - first[0]) < dmin:
         return [first]
     return [first, (round(start2, 2), round(end2, 2))]
 
 
-def maybe_cut_silent(db: Session, asset: Asset) -> dict[str, Any]:
-    """If the transcript is not speech, create pending duration candidates.
+def _render_in_flight(db: Session) -> bool:
+    return (
+        db.query(Job)
+        .filter(Job.job_type == "render")
+        .filter(Job.status.in_(("pending", "assigned", "processing")))
+        .first()
+    ) is not None
 
-    Idempotent: skips when the asset already has candidates.
-    Does not create render jobs.
-    """
+
+def maybe_cut_silent(db: Session, asset: Asset) -> dict[str, Any]:
     tx = (asset.extra_metadata or {}).get("transcription") or {}
     text = transcript_text(tx)
     if is_speech(text):
@@ -141,6 +141,7 @@ def maybe_cut_silent(db: Session, asset: Asset) -> dict[str, Any]:
         return {"kind": "silent", "created": 0, "skipped": "no_duration"}
 
     created = []
+    first = None
     for start, end in wins:
         c = Candidate(
             campaign_id=asset.campaign_id,
@@ -154,7 +155,26 @@ def maybe_cut_silent(db: Session, asset: Asset) -> dict[str, Any]:
         )
         db.add(c)
         db.flush()
+        if first is None:
+            first = c
         created.append({"id": str(c.id), "start": start, "end": end})
     db.commit()
-    logger.info("silent cut asset=%s windows=%s", asset.id, created)
-    return {"kind": "silent", "created": len(created), "candidates": created}
+
+    approved = None
+    if first is not None and not _render_in_flight(db):
+        try:
+            from app.services.candidate_lifecycle import approve_candidate
+            approved = approve_candidate(db, first.id)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("auto-approve silent failed asset=%s: %s", asset.id, e)
+            approved = {"status": "error", "reason": str(e)}
+    else:
+        approved = {"status": "deferred", "reason": "render_in_flight"}
+
+    logger.info("silent cut asset=%s windows=%s approve=%s", asset.id, created, approved)
+    return {
+        "kind": "silent",
+        "created": len(created),
+        "candidates": created,
+        "approved": approved,
+    }

@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Classify transcribed assets and cut silent/gameplay videos without Grok.
-
-Speech  = transcript has enough words → leave for Grok later
-Silent  = empty / 1-2 tokens / no real dialogue → 1-2 windows by duration rules
-
-Default: dry report. Use --cut to insert candidates. Use --approve to enqueue render.
-Default --limit 1 so we do not flood the Worker.
-"""
+"""Classify transcribed assets and cut silent/gameplay videos without Grok."""
 from __future__ import annotations
 
 import argparse
@@ -21,6 +14,7 @@ MIN_SPEECH_CHARS = 24
 MIN_SPEECH_WORDS = 6
 DEFAULT_MIN = 15.0
 DEFAULT_MAX = 35.0
+MIN_BYTES_FOR_UNKNOWN_DURATION = 2_000_000
 
 
 def _tx_text(tx) -> str:
@@ -45,9 +39,12 @@ def _tx_duration(tx, asset) -> float:
             return float(asset.duration_seconds)
         except (TypeError, ValueError):
             pass
-    if not isinstance(tx, dict):
-        return 0.0
-    segs = tx.get("segments") or []
+    if isinstance(tx, dict) and tx.get("duration"):
+        try:
+            return float(tx["duration"])
+        except (TypeError, ValueError):
+            pass
+    segs = (tx or {}).get("segments") if isinstance(tx, dict) else []
     end = 0.0
     if isinstance(segs, list):
         for s in segs:
@@ -65,34 +62,28 @@ def _is_speech(text: str) -> bool:
     if len(cleaned) < MIN_SPEECH_CHARS:
         return False
     words = re.findall(r"[A-Za-zÀ-ɏ0-9']+", cleaned)
-    if len(words) < MIN_SPEECH_WORDS:
-        return False
-    return True
+    return len(words) >= MIN_SPEECH_WORDS
 
 
 def _duration_window(campaign) -> tuple[float, float]:
-    rules = {}
-    spec = {}
+    rules, spec = {}, {}
     if campaign is not None:
         meta = campaign.source_metadata or {}
         if isinstance(meta, dict):
             rules = meta.get("rules") or {}
         spec = campaign.spec or {}
     dmin = (
-        rules.get("duration_min")
-        or rules.get("min_duration")
+        rules.get("duration_min") or rules.get("min_duration")
         or (spec.get("duration_min") if isinstance(spec, dict) else None)
         or DEFAULT_MIN
     )
     dmax = (
-        rules.get("duration_max")
-        or rules.get("max_duration")
+        rules.get("duration_max") or rules.get("max_duration")
         or (spec.get("duration_max") if isinstance(spec, dict) else None)
         or DEFAULT_MAX
     )
     try:
-        dmin = float(dmin)
-        dmax = float(dmax)
+        dmin, dmax = float(dmin), float(dmax)
     except (TypeError, ValueError):
         dmin, dmax = DEFAULT_MIN, DEFAULT_MAX
     if dmax <= dmin:
@@ -100,19 +91,22 @@ def _duration_window(campaign) -> tuple[float, float]:
     return dmin, dmax
 
 
-def _windows(duration: float, dmin: float, dmax: float) -> list[tuple[float, float]]:
+def _windows(duration: float, dmin: float, dmax: float, file_size) -> list[tuple[float, float]]:
     if duration <= 1:
+        try:
+            size = int(file_size or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size >= MIN_BYTES_FOR_UNKNOWN_DURATION:
+            return [(0.0, round(dmax, 2))]
         return []
     target = min(dmax, max(dmin, min(dmax, duration)))
     if duration <= dmin + 1:
         return [(0.0, round(duration, 2))]
     first = (0.0, round(min(target, duration), 2))
-    # second window later in the video if there is room
     start2 = max(0.0, duration * 0.45)
     end2 = min(duration, start2 + target)
-    if end2 - start2 < dmin * 0.8:
-        return [first]
-    if abs(start2 - first[0]) < 3:
+    if end2 - start2 < dmin * 0.8 or abs(start2 - first[0]) < 3:
         return [first]
     return [first, (round(start2, 2), round(end2, 2))]
 
@@ -121,8 +115,8 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--campaign-id", type=int, default=6)
     p.add_argument("--limit", type=int, default=1)
-    p.add_argument("--cut", action="store_true", help="insert candidates for silent assets")
-    p.add_argument("--approve", action="store_true", help="approve those candidates (creates render)")
+    p.add_argument("--cut", action="store_true")
+    p.add_argument("--approve", action="store_true")
     args = p.parse_args()
 
     from app.db.database import SessionLocal
@@ -153,26 +147,22 @@ def main() -> int:
             kind = "speech" if _is_speech(text) else "silent"
             dur = _tx_duration(tx, asset)
             preview = text[:80].replace("\n", " ")
-            print(f"{kind:6} asset={asset.id} dur={dur:.1f}s words={len(text.split())} tx={preview!r}")
+            print(f"{kind:6} asset={asset.id} dur={dur:.1f}s size={asset.file_size} words={len(text.split())} tx={preview!r}")
             if kind == "speech":
                 speech += 1
                 continue
             silent += 1
-            wins = _windows(dur, dmin, dmax)
+            wins = _windows(dur, dmin, dmax, asset.file_size)
             if not wins:
                 skipped += 1
-                print("       skip: no duration")
+                print("       skip: no duration and tiny/missing file")
                 continue
             if not args.cut:
                 print(f"       would cut {wins}")
                 continue
             if acted >= args.limit:
                 continue
-            existing = (
-                db.query(Candidate)
-                .filter(Candidate.asset_id == asset.id)
-                .count()
-            )
+            existing = db.query(Candidate).filter(Candidate.asset_id == asset.id).count()
             if existing:
                 print(f"       skip: already {existing} candidates")
                 skipped += 1

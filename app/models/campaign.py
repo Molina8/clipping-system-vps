@@ -39,13 +39,16 @@ CAMPAIGN_SOURCE_VALUES = tuple(s.value for s in CampaignSource)
 
 
 class CampaignStatus(str, enum.Enum):
-    DRAFT = "draft"           # created, not yet analyzed
-    ANALYZING = "analyzing"   # OpenClaw/MiniMax processing
-    READY = "ready"           # spec generated, assets can be resolved
-    ACTIVE = "active"         # jobs flowing
-    PAUSED = "paused"         # user-paused
-    COMPLETED = "completed"   # all clips done
-    ARCHIVED = "archived"     # soft-deleted
+    # Pipeline v2 statuses (added 2026-09-17). Must stay in sync with
+    # alembic/versions/0011_campaign_status_pipeline_v2.py which mirrors
+    # the same values into the ck_campaigns_status check constraint.
+    DISCOVERED = "discovered"           # paso 1: minimal upsert only
+    BRIEFED = "briefed"                 # paso 3a: brief-reader wrote rules
+    ASSETS_RESOLVED = "assets_resolved" # paso 3b: drive-resolver expanded folders
+    SCORED = "scored"                   # paso 3c: campaign-scorer wrote score
+    BLOCKED_NO_ASSETS = "blocked_no_assets"  # paso 3c: 0 real assets
+    FAILED_BRIEF = "failed_brief"       # paso 3a: brief unreadable
+    FAILED_RESOLVE = "failed_resolve"   # paso 3b: drive access denied
 
 
 CAMPAIGN_STATUS_VALUES = tuple(s.value for s in CampaignStatus)

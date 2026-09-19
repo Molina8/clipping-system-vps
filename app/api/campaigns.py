@@ -70,14 +70,48 @@ _VIDEO_PATTERNS = (
 )
 
 
+_NON_VIDEO_KINDS = frozenset({
+    "drive_folder",
+    "dropbox_folder",
+    "brand_asset",
+    "youtube_profile",
+    "twitter_profile",
+    "tiktok_profile",
+    "instagram_profile",
+    "profile",
+})
+_NON_VIDEO_URL_PATTERNS = (
+    "/drive/folders/",
+    "/drive/u/",
+    "/document/d/",
+    "/documents/d/",
+    "/forms/d/",
+    "/spreadsheets/d/",
+    "/presentation/d/",
+    "/file/d/",
+    "/folders/",
+    "@",  # bare profile handles like https://www.youtube.com/@WhopIO
+)
+
+
 def _is_real_video_url(url: str | None) -> bool:
     """Return True iff the URL points at a processable video.
 
     Conservative: when in doubt, returns False (caller should NOT enqueue).
+
+    2026-09-19 (Molina): drive-resolver deja el folder "cabecera" como asset
+    (asset_type='video', extra_metadata.kind='drive_folder') además de los
+    archivos reales que expande. Esos folders + brand_assets (Google Docs)
+    + profile URLs NO se descargan. Filtramos por patrones de URL como red
+    de seguridad (además del filtro por kind en download_enqueue_tick.py).
     """
     if not url:
         return False
     u = url.lower()
+
+    # Negative patterns first: explicit non-video URLs.
+    if any(pat in u for pat in _NON_VIDEO_URL_PATTERNS):
+        return False
 
     # Direct media file extension (most reliable signal).
     if any(u.endswith(ext) or f"{ext}?" in u for ext in _VIDEO_EXTENSIONS):
@@ -231,25 +265,45 @@ def enqueue_pipeline(
     # We must iterate because the first asset by created_at is usually a
     # banner/icon from whop CDN — useless for the Worker. We pick the
     # earliest asset whose URL is a real video / external media.
+    #
+    # 2026-09-18 (option 3 fix): we also exclude asset_type='folder'.
+    # Those rows are placeholders for Drive folders that
+    # `drive-resolver-tick` expands into child assets; they are NOT
+    # directly downloadable and must never reach the Worker as a
+    # download job. If we ever pick one, mark it skipped and keep
+    # looking for the next processable asset.
     from sqlalchemy import or_
 
+    def _is_skippable(a: Asset) -> bool:
+        if a.asset_type == "folder":
+            return True
+        if (a.extra_metadata or {}).get("skip_download") is True:
+            return True
+        return False
+
+    def _mark_skipped(a: Asset, reason: str) -> None:
+        a.status = "failed"
+        meta = dict(a.extra_metadata or {})
+        meta["skip_download"] = True
+        meta["skipped_reason"] = reason
+        meta["skipped_at"] = datetime.now(timezone.utc).isoformat()
+        a.extra_metadata = meta
+
+    # 2026-09-18: una sola pasada — cualquier asset excepto folder, ordenado por
+    # antigüedad. _is_skippable filtra folder + skip_download por defensa.
     candidates = (
         db.query(Asset)
         .filter(Asset.campaign_id == campaign_id)
-        .filter(Asset.asset_type == "video")
+        .filter(Asset.asset_type != "folder")
+        .filter(Asset.status != "failed")  # no reintentar ya-fallidos en este run
         .order_by(Asset.created_at.asc())
         .all()
     )
-    asset = next((a for a in candidates if _is_real_video_url(a.source_url)), None)
-    if asset is None:
-        # Fallback: any asset_type, first processable URL
-        candidates = (
-            db.query(Asset)
-            .filter(Asset.campaign_id == campaign_id)
-            .order_by(Asset.created_at.asc())
-            .all()
-        )
-        asset = next((a for a in candidates if _is_real_video_url(a.source_url)), None)
+    processable = [a for a in candidates if not _is_skippable(a)]
+    asset = next(
+        (a for a in processable if _is_real_video_url(a.source_url)),
+        None,
+    )
     if asset is None:
         raise HTTPException(
             status_code=409,

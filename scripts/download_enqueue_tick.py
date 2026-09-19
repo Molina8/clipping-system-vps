@@ -66,46 +66,17 @@ SCORED_STATUSES = ("scored", "ready")
 
 
 def _is_real_video_url(url: str) -> bool:
-    """Mirror of app/api/campaigns.py::_is_real_video_url — kept local
-    so this script has zero dependency on the FastAPI app imports."""
-    if not url:
-        return False
+    """Import the canonical filter from app.api.campaigns so this script
+    never drifts from what the API endpoint considers processable.
+
+    The local copy used to live here but it diverged: it accepted
+    https://www.youtube.com/@WhopIO (bare profile) which the API rejects.
+    Importing the canonical function eliminates that whole class of bugs.
+    """
+    from app.api.campaigns import _is_real_video_url as _canonical
+    return _canonical(url)
+
     from urllib.parse import urlparse
-
-    p = urlparse(url)
-    host = (p.netloc or "").lower()
-    path = (p.path or "").lower()
-
-    # Direct media extensions
-    media_ext = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
-    if any(path.endswith(ext) for ext in media_ext):
-        return True
-
-    # Processable hosts
-    processable_hosts = (
-        "youtube.com", "youtu.be",
-        "drive.google.com",
-        "dropbox.com", "mega.nz", "vimeo.com",
-    )
-    bare_profile_hosts = ("instagram.com", "tiktok.com")
-
-    for h in processable_hosts:
-        if host == h or host.endswith("." + h):
-            # youtube bare profile reject
-            if h == "youtube.com" and path in ("", "/"):
-                return False
-            return True
-
-    # Bare profile pages are NOT processable
-    for h in bare_profile_hosts:
-        if host == h or host.endswith("." + h):
-            if "/p/" in path or "/reel/" in path or "/video/" in path:
-                return True
-            return False
-
-    return False
-
-
 def _enqueue_download_for_campaign(db, campaign_id: int, dry_run: bool) -> dict:
     """Create a download job for the first processable asset of a campaign.
 
@@ -122,31 +93,91 @@ def _enqueue_download_for_campaign(db, campaign_id: int, dry_run: bool) -> dict:
         return {"created": 0, "skipped": 0, "asset_id": None, "error": "campaign_not_found"}
 
     # Pick the first processable asset (mirror enqueue_pipeline logic).
+    # 2026-09-18 (Molina): filtro explícito Asset.asset_type != 'folder'.
+    # Drive/Dropbox folder assets son placeholders que el resolver expande
+    # en hijos; SIEMPRE se saltan. (Antes solo confiábamos en
+    # _is_real_video_url, que no excluía /drive/folders/ explícitamente.)
     candidates = (
         db.query(Asset)
         .filter(Asset.campaign_id == campaign_id)
+        .filter(Asset.asset_type != "folder")
         .filter(Asset.status == "pending")
         .order_by(Asset.created_at.asc())
         .all()
     )
-    asset = next((a for a in candidates if _is_real_video_url(a.source_url)), None)
+    # Defense in depth: filtra cualquier folder (p.ej. registros viejos con
+    # asset_type mal puesto) y respeta skip_download.
+    # 2026-09-19 (Molina): drive-resolver deja el folder "cabecera" como asset
+    # (asset_type='video', extra_metadata.kind='drive_folder') además de los
+    # archivos reales que expande. Esos folders + brand_assets (Google Docs)
+    # + profile URLs NO se descargan. Filtramos por extra_metadata.kind Y
+    # por patrones de URL como red de seguridad.
+    _SKIP_KINDS = frozenset({
+        "drive_folder",
+        "dropbox_folder",
+        "brand_asset",
+        "youtube_profile",
+        "twitter_profile",
+        "tiktok_profile",
+        "instagram_profile",
+        "profile",
+    })
+    _SKIP_URL_PATTERNS = (
+        "/drive/folders/",
+        "/drive/u/",
+        "/document/d/",
+        "/documents/d/",
+        "/forms/d/",
+        "/spreadsheets/d/",
+        "/presentation/d/",
+        "/file/d/",
+        "/folders/",
+        "@",  # bare profile handles like https://www.youtube.com/@WhopIO
+    )
+
+    def _is_skippable(a):
+        if a.asset_type == "folder":
+            return True
+        if (a.extra_metadata or {}).get("skip_download") is True:
+            return True
+        kind = (a.extra_metadata or {}).get("kind")
+        if kind in _SKIP_KINDS:
+            return True
+        url = (a.source_url or "").lower()
+        if any(pat in url for pat in _SKIP_URL_PATTERNS):
+            return True
+        return False
+    processable = [a for a in candidates if not _is_skippable(a)]
+    asset = next(
+        (a for a in processable if _is_real_video_url(a.source_url)),
+        None,
+    )
     if asset is None:
         return {"created": 0, "skipped": 0, "asset_id": None,
                 "skipped_reason": "no_processable_asset"}
 
     asset_id = str(asset.id)
 
-    # Idempotency: don't create a new pending job if one is open.
+    # Idempotency per-asset: don't re-enqueue the SAME asset if it already has
+    # a job in flight (pending/processing/assigned) or already finished
+    # (completed/failed/cancelled). 2026-09-19 (Molina): we WANT to enqueue
+    # multiple assets per campaign in parallel -- the previous cap ("any
+    # terminal job for this campaign → skip") limited us to 1 download per
+    # campaign forever. Now we only skip when THIS asset already has a job.
     existing = (
         db.query(Job)
         .filter(Job.job_type == "download")
-        .filter(Job.payload["campaign_id"].astext == str(c.id))
-        .filter(Job.status.in_(("pending", "processing", "assigned")))
+        .filter(Job.payload["asset_id"].astext == asset_id)
+        .filter(Job.status.in_((
+            "pending", "processing", "assigned",
+            "completed", "failed", "cancelled",
+        )))
         .first()
     )
     if existing is not None:
         return {"created": 0, "skipped": 1, "asset_id": asset_id,
-                "existing_job_id": str(existing.id)}
+                "existing_job_id": str(existing.id),
+                "skipped_reason": "asset_already_has_job"}
 
     if dry_run:
         return {"created": 1, "skipped": 0, "asset_id": asset_id, "dry_run": True}
@@ -209,10 +240,41 @@ def main() -> int:
         )
 
         # 2) Enqueue download job per campaign.
+        #    2026-09-18 (Molina): capturar IntegrityError por campaña — un INSERT
+        #    que dispare la CHECK constraint de jobs (p.ej. por un asset legacy
+        #    mal marcado como 'drive_folder' con url de carpeta) NO debe matar
+        #    el run entero; se rollbackea la sesión local, se cuenta como
+        #    'skipped_folder_legacy' y se continúa con la siguiente campaña.
+        from sqlalchemy.exc import IntegrityError
         for c in scored:
             try:
                 r = _enqueue_download_for_campaign(db, c.id, dry_run=args.dry_run)
+            except IntegrityError as e:
+                # Check constraint violation (p.ej. ck_jobs_no_folder_download).
+                # Si toca, la campaña se queda sin encolar pero el resto sigue.
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                err_kind = "integrity_violation"
+                err_msg = str(e.orig)[:300] if hasattr(e, "orig") else str(e)[:300]
+                logger.warning(
+                    "enqueue skipped for campaign %s (%s): %s",
+                    c.id, err_kind, err_msg,
+                )
+                summary["skipped"] += 1
+                summary["campaigns"].append(
+                    {
+                        "id": c.id, "name": c.name, "status": c.status,
+                        "error": err_kind, "error_detail": err_msg,
+                    }
+                )
+                continue
             except Exception as e:  # noqa: BLE001
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
                 logger.exception("enqueue failed for campaign %s: %s", c.id, e)
                 summary["skipped"] += 1
                 summary["campaigns"].append(

@@ -10,8 +10,14 @@ from app.services.discovery.providers.whop import WhopProvider
 
 
 # Whop tenants (sub-apps). Add more as you find new tenants.
+# 2026-09-17 (pipeline v2): primary tenant is Content Rewards.
+# Whop exposes the campaign list JSON API at:
+#   {tenant}/api/campaign/campaigns/discover?limit=N&sortBy=trending
+# For host-based tenants (`whop.com/<slug>/`) the API actually lives on
+# `<slug>.com/api/campaign/campaigns/discover` (subdomain split). The
+# WhopProvider normalizes the URL — see `_discover_via_api`.
 _WHOP_TENANTS: list[str] = [
-    "https://b4e0vdqv6zgqeqj4pfgm.apps.whop.com",  # Clipping Culture (primary)
+    "https://contentrewards.com",                    # Content Rewards (primary, 2026-09-17)
     # Add additional tenants here when known.
 ]
 

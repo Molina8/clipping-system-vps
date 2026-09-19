@@ -135,10 +135,23 @@ def upsert_campaign(
 
     metadata: dict[str, Any] = {
         "discovered": discovered.model_dump(),
+        # NEW (2026-09-17, pipeline v2): expose top-level so brief-reader and
+        # downstream crons can read the full Whop API surface without re-parsing
+        # `discovered` (Pydantic JSON dict). Keeps back-compat for older
+        # consumers that look at `asset_links` / `cpm_usd_per_1k`.
         "asset_links": list(discovered.asset_links),
         "cpm_usd_per_1k": discovered.cpm_usd_per_1k,
         "prize_pool_usd": discovered.prize_pool_usd,
         "joined": discovered.joined,
+        "payouts": [p.model_dump() for p in discovered.payouts],
+        "reference_materials": [r.model_dump() for r in discovered.reference_materials],
+        "organization_name": discovered.organization_name,
+        "organization_verified": discovered.organization_verified,
+        "organization_id": discovered.organization_id,
+        "categories": list(discovered.categories),
+        "platforms": list(discovered.platforms),
+        "status": discovered.status,
+        "requires_application": discovered.requires_application,
     }
 
     if existing is not None:

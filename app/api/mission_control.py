@@ -224,6 +224,22 @@ def campaigns_list(
 
         items = []
         for r in rows:
+            sm = r.source_metadata or {}
+            # El scorer escribe el score en source_metadata.score (sub-objeto):
+            #   { total, priority, tie_break, breakdown, rank_reason }
+            # El endpoint legacy buscaba priority_score / priority_tier planos
+            # que el cron nunca escribía. Mantenemos las keys planas como
+            # fallback por si en el futuro alguien rellena esos campos, pero la
+            # fuente de verdad es el sub-objeto `score`.
+            score_obj = sm.get("score") if isinstance(sm.get("score"), dict) else {}
+            priority_score = sm.get("priority_score")
+            if priority_score is None:
+                priority_score = score_obj.get("total")
+            priority_tier = sm.get("priority_tier")
+            if priority_tier is None and score_obj.get("priority") is not None:
+                # El score_obj.priority ya viene clamp(1..10); lo dejamos como
+                # número. La card lo pinta como "priority N/10".
+                priority_tier = score_obj.get("priority")
             items.append(
                 {
                     "id": r.id,
@@ -241,6 +257,11 @@ def campaigns_list(
                     "clips_approved": r.clips_approved,
                     "clips_approved_qa": r.clips_approved_qa,
                     "clips_published": r.clips_published,
+                    "priority_score": priority_score,
+                    "priority_tier": priority_tier,
+                    "priority_tie_break": score_obj.get("tie_break"),
+                    "priority_breakdown": score_obj.get("breakdown"),
+                    "priority_rank_reason": score_obj.get("rank_reason"),
                     "created_at": _iso(r.created_at),
                     "updated_at": _iso(r.updated_at),
                 }
@@ -277,6 +298,24 @@ def campaign_detail(
         if c is None:
             raise HTTPException(status_code=404, detail="Campaign not found")
 
+        sm = c.source_metadata or {}
+        # Errores persistidos por el brief-reader / resolver. Forma estable:
+        #   { "kind": "<short_tag>", "message": "<human>", "at": "<iso>" }
+        # (Los registros viejos pueden tener solo string suelto; lo soportamos.)
+        briefing_error = sm.get("briefing_error")
+        if isinstance(briefing_error, dict):
+            briefing_error_out = briefing_error
+        elif briefing_error:
+            briefing_error_out = {"kind": "legacy_string", "message": str(briefing_error), "at": None}
+        else:
+            briefing_error_out = None
+        resolve_error = sm.get("resolve_error")
+        if isinstance(resolve_error, dict):
+            resolve_error_out = resolve_error
+        elif resolve_error:
+            resolve_error_out = {"kind": "legacy_string", "message": str(resolve_error), "at": None}
+        else:
+            resolve_error_out = None
         campaign = {
             "id": c.id,
             "name": c.name,
@@ -290,6 +329,8 @@ def campaign_detail(
             "assets_count": c.assets_count,
             "clips_approved": c.clips_approved,
             "clips_published": c.clips_published,
+            "briefing_error": briefing_error_out,
+            "resolve_error": resolve_error_out,
             "created_at": _iso(c.created_at),
             "updated_at": _iso(c.updated_at),
         }

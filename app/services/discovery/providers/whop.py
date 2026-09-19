@@ -186,27 +186,63 @@ class WhopProvider(CampaignProvider):
         out: list[DiscoveredCampaign] = []
         seen: set[str] = set()
         for c in cards:
-            camp_uuid = c["campaign_uuid"]
+            # 2026-09-17: _api_card_to_struct now returns full DiscoveredCampaign-
+            # shaped dict (including external_id). Other paths (HTML/Playwright)
+            # still emit the older flat shape. Normalize both.
+            if "external_id" in c and "detail_url" in c:
+                # New shape from _api_card_to_struct (pipeline v2, 2026-09-17).
+                # Pass EVERY field the API card exposes through to the model
+                # so downstream cron 3a (brief-reader) can read the full Whop
+                # surface from `source_metadata.discovered`. Previous version
+                # hardcoded payouts=[]/reference_materials=[] here, which
+                # silently dropped the JSONB in BD even though _api_card_to_struct
+                # had filled it correctly — root cause of the "upsert empty"
+                # bug found during smoke test 2026-09-17.
+                dc = DiscoveredCampaign(
+                    provider=c.get("provider", "whop"),
+                    external_id=c["external_id"],
+                    detail_url=c["detail_url"],
+                    name=c["name"],
+                    description=c.get("description"),
+                    cpm_usd_per_1k=c.get("cpm_usd_per_1k"),
+                    prize_pool_usd=c.get("prize_pool_usd"),
+                    joined=c.get("joined"),
+                    asset_links=c.get("asset_links", []),
+                    payouts=c.get("payouts", []),
+                    reference_materials=c.get("reference_materials", []),
+                    organization_name=c.get("organization_name"),
+                    organization_verified=c.get("organization_verified"),
+                    organization_id=c.get("organization_id"),
+                    categories=c.get("categories", []),
+                    platforms=c.get("platforms", []),
+                    status=c.get("status"),
+                    requires_application=c.get("requires_application"),
+                    primary_payout_cents=c.get("primary_payout_cents"),
+                    raw={**c.get("raw", {}), "fetch_failed": fetch_failed},
+                )
+                camp_uuid = c["external_id"].split("/", 1)[-1]
+            else:
+                camp_uuid = c["campaign_uuid"]
+                dc = DiscoveredCampaign(
+                    provider="whop",
+                    external_id=f"{c.get('experience_id','?')}/{camp_uuid}",
+                    detail_url=c["detail_url"],
+                    name=c["name"],
+                    description=c.get("description"),
+                    cpm_usd_per_1k=c.get("cpm"),
+                    prize_pool_usd=c.get("prize_pool"),
+                    joined=c.get("joined"),
+                    asset_links=c.get("asset_links", []),
+                    raw={
+                        "experience_id": c.get("experience_id"),
+                        "campaign_uuid": camp_uuid,
+                        "card_text": c.get("description"),
+                        "fetch_failed": fetch_failed,
+                    },
+                )
             if camp_uuid in seen:
                 continue
             seen.add(camp_uuid)
-            dc = DiscoveredCampaign(
-                provider="whop",
-                external_id=f"{c.get('experience_id','?')}/{camp_uuid}",
-                detail_url=c["detail_url"],
-                name=c["name"],
-                description=c.get("description"),
-                cpm_usd_per_1k=c.get("cpm"),
-                prize_pool_usd=c.get("prize_pool"),
-                joined=c.get("joined"),
-                asset_links=c.get("asset_links", []),
-                raw={
-                    "experience_id": c.get("experience_id"),
-                    "campaign_uuid": camp_uuid,
-                    "card_text": c.get("description"),
-                    "fetch_failed": fetch_failed,
-                },
-            )
             out.append(dc)
             if len(out) >= limit:
                 break
@@ -258,50 +294,141 @@ class WhopProvider(CampaignProvider):
         return cards, None
 
     def _api_card_to_struct(self, c: dict[str, Any]) -> dict[str, Any] | None:
-        """Map a JSON API campaign record to the internal card dict."""
+        """Map a Whop JSON API campaign record to the internal card dict.
+
+        Redesigned 2026-09-17 (pipeline v2): we now keep the FULL API surface
+        (payouts[], referenceMaterials[], organization, categories, platforms,
+        status, requires_application) so downstream cron 3a (brief-reader) can
+        consume everything from `source_metadata.discovered` without re-fetching
+        the canonical `source_url` (which Whop auth-gates).
+
+        Returns a dict shaped to fit DiscoveredCampaign.model_validate(...).
+        """
+        camp_uuid = c.get("id")
+        exp_id = c.get("organizationExperienceId") or ""
+        if not camp_uuid or not exp_id:
+            return None
         try:
-            camp_uuid = c.get("id")
-            exp_id = c.get("organizationExperienceId") or ""
-            if not camp_uuid or not exp_id:
-                return None
             name = (c.get("name") or "").strip() or f"Whop campaign {camp_uuid[:8]}"
             description = c.get("description") or None
-            cpm_cents = c.get("cpmMinRateCents")
-            cpm = float(cpm_cents) / 100.0 if cpm_cents is not None else None
+            # Filter "Submissions closed" / closed campaigns (2026-09-18):
+            # Coinpoker added with `status='active'` but the card shows a
+            # "Submissions closed" badge — the public JSON API doesn't expose
+            # a dedicated `submissionsClosed` field, so we use the only
+            # inequivocal signals we have: budget fully spent (10000 bps)
+            # or explicitly hidden from public discover. Refine when Whop
+            # exposes the real badge-driving field.
+            metrics = c.get("metrics") or {}
+            bps = metrics.get("budgetProgressBps")
+            if isinstance(bps, (int, float)) and bps >= 10000:
+                logger.info(
+                    "whop skip %s: budgetProgressBps=%s (>=10000 = fully spent)",
+                    camp_uuid, bps,
+                )
+                return None
+            if c.get("showOnDiscover") is False:
+                logger.info(
+                    "whop skip %s: showOnDiscover=False (hidden from public discover)",
+                    camp_uuid,
+                )
+                return None
+            # TEMPORAL hardcoded blacklist (2026-09-18): Whop pinta "Submissions
+            # closed" en la card pero NO expone el campo en el JSON público.
+            # Bloqueamos por external_id/name las campañas problemáticas
+            # conocidas hasta que encontremos el endpoint auth-only o Whop
+            # exponga el campo. Coinpoker id=b147171f-1c01-4a21-803b-ed03db59d82f
+            # aparece como "active" con budgetProgressBps=4921 y showOnDiscover=null.
+            _CLOSED_NAME_PATTERNS = (
+                "coinpoker logo general campaign",
+            )
+            name_lc = name.lower()
+            for bad in _CLOSED_NAME_PATTERNS:
+                if bad in name_lc:
+                    logger.info(
+                        "whop skip %s: name matches closed-card blacklist (%r)",
+                        camp_uuid, bad,
+                    )
+                    return None
+
             budget_cents = c.get("budgetCents")
             pool = float(budget_cents) / 100.0 if budget_cents is not None else None
             metrics = c.get("metrics") or {}
-            joined = metrics.get("approvedSubmissionCount")
+            joined_raw = metrics.get("approvedSubmissionCount")
             try:
-                joined = int(joined) if joined is not None else None
+                joined = int(joined_raw) if joined_raw is not None else None
             except (TypeError, ValueError):
                 joined = None
+
+            payouts: list[dict[str, Any]] = []
+            for pay in c.get("payouts") or []:
+                if not isinstance(pay, dict):
+                    continue
+                payouts.append({
+                    "platform": pay.get("platform"),
+                    "payout_type": pay.get("payoutType"),
+                    "rate_cents": pay.get("rateCents"),
+                    "min_payout_cents": pay.get("minPayoutCents"),
+                    "max_payout_cents": pay.get("maxPayoutCents"),
+                })
+
+            cpm_min_cents = c.get("cpmMinRateCents")
+            cpm_min_usd = (
+                float(cpm_min_cents) / 100.0 if cpm_min_cents is not None else None
+            )
+
+            reference_materials: list[dict[str, Any]] = []
             asset_links: list[str] = []
             for rm in c.get("referenceMaterials") or []:
-                if isinstance(rm, dict) and rm.get("url"):
-                    asset_links.append(rm["url"])
+                if not isinstance(rm, dict) or not rm.get("url"):
+                    continue
+                reference_materials.append({
+                    "media_type": rm.get("mediaType"),
+                    "type": rm.get("type"),
+                    "url": rm["url"],
+                    "name": rm.get("name"),
+                })
+                asset_links.append(rm["url"])
+
+            categories = c.get("categories") or []
+            platforms = c.get("platforms") or []
+
             return {
-                "experience_id": exp_id,
-                "campaign_uuid": camp_uuid,
+                "provider": "whop",
+                "external_id": f"{exp_id}/{camp_uuid}",
                 "detail_url": f"https://whop.com/experiences/{exp_id}/campaigns/{camp_uuid}",
                 "name": name,
                 "description": description,
-                "cpm": cpm,
-                "prize_pool": pool,
+                "cpm_usd_per_1k": cpm_min_usd,
+                "prize_pool_usd": pool,
                 "joined": joined,
+                "payouts": payouts,
+                "reference_materials": reference_materials,
+                "organization_name": c.get("organizationName"),
+                "organization_verified": c.get("organizationVerified"),
+                "organization_id": c.get("organizationId"),
+                "categories": categories,
+                "platforms": platforms,
+                "status": c.get("status"),
+                "requires_application": c.get("requiresApplication"),
+                "primary_payout_cents": c.get("primaryPayoutCents"),
                 "asset_links": asset_links,
-                "raw_api": {
+                "raw": {
                     "organization_name": c.get("organizationName"),
                     "organization_verified": c.get("organizationVerified"),
-                    "platforms": c.get("platforms"),
+                    "platforms": platforms,
                     "payouts": c.get("payouts"),
+                    "referenceMaterials": c.get("referenceMaterials"),
                     "requires_application": c.get("requiresApplication"),
                     "status": c.get("status"),
                     "primary_payout_cents": c.get("primaryPayoutCents"),
+                    "banner": c.get("banner"),
+                    "categories": categories,
+                    "metrics": metrics,
+                    "organization_logo_url": c.get("organizationLogoUrl"),
                 },
             }
         except Exception as e:  # noqa: BLE001
-            logger.warning("whop api_card_to_struct failed: %s", e)
+            logger.exception("whop api_card_to_struct failed for %s: %s", c.get("id"), e)
             return None
 
     # --- Playwright (SPA) discovery ----------------------------------------
@@ -537,6 +664,18 @@ class WhopProvider(CampaignProvider):
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             logger.info("whop fetch_detail failed for %s: %s", campaign.detail_url, e)
             return campaign
+        # Filter "Submissions closed" / closed campaigns (2026-09-18):
+        # The public JSON listing API returns status='active' for ALL cards
+        # (Coinpoker included, even though the card badge says "Submissions
+        # closed"). Whop hides the badge-driving field behind the auth-gated
+        # detail page. To avoid adding no-go campaigns we check the detail
+        # HTML (including embedded JSON/scripts) for clear closed-state signals.
+        if self._detail_signals_closed(src):
+            logger.info(
+                "whop skip %s: detail HTML contains closed/submissions-ended signal",
+                campaign.detail_url,
+            )
+            return None
         links = _extract_links(src)
         url_lc = [u.lower() for u in links]
         keep: list[str] = []

@@ -38,8 +38,14 @@ logger = logging.getLogger(__name__)
 
 
 def classify_link(url: str) -> str:
-    """Return a coarse category: drive, docs, youtube, dropbox, mega, external."""
+    """Return a coarse category: drive, drive_folder, dropbox_folder, docs,
+    googlesheets, youtube, dropbox, mega, external."""
     u = url.lower()
+    # 2026-09-18 (Molina): Drive folders/filefolders ANTES del `drive` generico.
+    # Si entran como `drive`, el resolver los clasifica como video y el
+    # download-enqueue intenta encolarlos (CheckViolation + ruido en logs).
+    if "drive.google.com/drive/folders/" in u or "drive.google.com/drive/filefolders/" in u:
+        return "drive_folder"
     if "drive.google.com" in u:
         return "drive"
     if "docs.google.com/document" in u or "docs.google.com/presentation" in u or \
@@ -49,12 +55,13 @@ def classify_link(url: str) -> str:
         return "youtube"
     if "docs.google.com/spreadsheets" in u:
         return "googlesheets"
+    if "dropbox.com/scl/fo/" in u:
+        return "dropbox_folder"
     if "dropbox.com" in u:
         return "dropbox"
     if "mega.nz" in u:
         return "mega"
     return "external"
-
 
 def is_brief_kind(kind: str, url: str = "") -> bool:
     """True if the asset should be treated as a campaign brief (docs/PDF),
@@ -237,7 +244,7 @@ def resolve_assets_for_campaign(
             source_provider=discovery_provider or ("brief" if is_brief else kind),
             asset_type="brief" if is_brief else (
                 "video" if kind in ("youtube", "drive", "dropbox", "mega", "external")
-                else "sheet"
+                else ("folder" if kind in ("drive_folder", "dropbox_folder") else "sheet")
             ),
             status=AssetStatus.PENDING.value,
             extra_metadata={
@@ -247,6 +254,26 @@ def resolve_assets_for_campaign(
                 "original_url": original if original != url else None,
             },
         )
+
+        # 2026-09-18 (Molina): ni los folders ni los Google Docs se descargan
+        # nunca. Los marcamos como `failed` con skip_download=true desde el
+        # momento de creación, igual que los folders. Así no aparecen en
+        # mission control como `pending` junto a los vídeos.
+        if asset.asset_type == "folder":
+            asset.status = AssetStatus.FAILED.value
+            asset.extra_metadata = {
+                **asset.extra_metadata,
+                "skip_download": True,
+                "skipped_reason": "parent_folder_placeholder_never_downloaded_directly",
+            }
+        elif kind in ("docs", "googlesheets"):
+            asset.asset_type = "document"
+            asset.status = AssetStatus.FAILED.value
+            asset.extra_metadata = {
+                **asset.extra_metadata,
+                "skip_download": True,
+                "skipped_reason": f"google_{kind}_never_downloaded",
+            }
         db.add(asset)
         db.flush()  # we need asset.id for the brief extraction if we save a path
 

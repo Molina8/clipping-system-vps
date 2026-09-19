@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""clip-decider-tick (every 30m).
+
+Para cada asset `transcribed` SIN candidate aprobado, generar 1-3 proposals
+via ClipSelectionAgent, auto-aprobarlos, y encolar render jobs.
+
+Source of rules (en orden de precedencia):
+  1. Campaign.source_metadata.rules  (donde estan pobladas hoy)
+  2. Campaign.spec                    (canonico segun el modelo, vacio hoy)
+  3. Defaults sensatos si ninguna tiene datos
+
+Heuristica de N clips por asset:
+  duracion < 30s           -> 1
+  30s <= duracion < 120s   -> 2
+  duracion >= 120s         -> 3
+  Override: si rules.clips_per_asset existe, se respeta (clamp [1,3]).
+
+Idempotencia:
+  - Solo procesa assets sin candidate aprobado.
+  - Auto-aprueba candidates recien creados (status='pending' -> 'approved').
+  - NO duplica inserts porque chequea 'candidates WHERE asset_id=...' antes.
+
+LLM:
+  - Por defecto usa LLMClient real (con la config de MiniMax/M3 que ya hay).
+  - Si MOLINA_FORCE_MOCK_LLM=1, fuerza MockLLMClient (util para tests offline).
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+# Append project root so 'app.*' imports work even when called by openclaw
+sys.path.insert(0, "/opt/clipping-system")
+
+from app.db.database import SessionLocal
+from app.models.asset import Asset, AssetStatus
+from app.models.campaign import Campaign, CampaignSource, CampaignStatus
+from app.models.candidate import Candidate
+from app.clip_selection.agent import ClipSelectionAgent
+from app.clip_selection.llm_client import HttpLLMClient, MockLLMClient
+from app.services.job_service import create_job
+try:
+    from app.config import settings as _settings
+except Exception:
+    _settings = None  # type: ignore
+
+logging.basicConfig(
+    level=os.environ.get("CLIP_DECIDER_LOG", "INFO"),
+    format="%(asctime)s %(levelname)s clip-decider %(message)s",
+)
+log = logging.getLogger("clip_decider_tick")
+
+DEFAULT_RULES = {
+    "language": "es",
+    "duration_min": 15.0,
+    "duration_max": 60.0,
+    "must_not": [],
+    "must_include_caption": "",
+    "platforms": ["tiktok", "instagram", "youtube"],
+    "attribution": {"type": "tag"},
+}
+
+
+def _hearts(duration_s: float, override: int | None) -> int:
+    if override is not None:
+        return max(1, min(3, int(override)))
+    if duration_s < 30:
+        return 1
+    if duration_s < 120:
+        return 2
+    return 3
+
+
+def _resolve_rules(campaign: Campaign) -> dict:
+    """Merge source_metadata.rules + spec + defaults."""
+    rules = dict(DEFAULT_RULES)
+    sm_rules = (campaign.source_metadata or {}).get("rules") or {}
+    if isinstance(sm_rules, dict):
+        rules.update({k: v for k, v in sm_rules.items() if v not in (None, "", [], {})})
+    spec = campaign.spec or {}
+    for k in ("duration_min", "duration_max", "language", "clips_per_asset"):
+        if k in spec and spec[k] is not None:
+            rules[k] = spec[k]
+    return rules
+
+
+
+def _pick_random_segments(asset: "Asset", n: int) -> list:
+    """Cuando no hay transcript (musica, sin dialogos) elige N ventanas
+    aleatorias validas segun las reglas de la campana.
+
+    Devuelve una lista de (start, end) en segundos. Garantiza:
+      - start < end
+      - duracion dentro de [duration_min, duration_max] si estan en rules
+      - no se solapan entre si (margen 0.5s)
+    """
+    import random
+    dur = float(asset.duration_seconds or 60.0)  # fallback 60s si no hay duracion
+    rules_for_dur = {"min": 15.0, "max": 60.0}
+    # las rules vendran pasadas como param 'rules' desde el caller
+    return []  # placeholder, la version real recibe rules
+
+
+def _transcription_has_text(asset) -> bool:
+    em = dict(asset.extra_metadata or {})
+    tr = em.get("transcription") or {}
+    text = (tr.get("text") or "").strip()
+    if text:
+        return True
+    segs = tr.get("segments") or []
+    return any((s.get("text") or "").strip() for s in segs)
+
+
+def _build_random_candidates(asset, n: int, rules: dict) -> list:
+    """N candidatos aleatorios respetando duration_min/max y sin solape."""
+    import random
+    dur_min = float(rules.get("duration_min") or 15.0)
+    dur_max = float(rules.get("duration_max") or 60.0)
+    if dur_min > dur_max:
+        dur_min, dur_max = dur_max, dur_min
+    if dur_min < 1.0:
+        dur_min = 1.0
+    total = float(asset.duration_seconds or max(60.0, dur_max + 5.0))
+
+    rng = random.SystemRandom()
+    out = []
+    intentos = 0
+    while len(out) < n and intentos < 200:
+        intentos += 1
+        length = rng.uniform(dur_min, min(dur_max, max(dur_min + 1.0, total - 1.0)))
+        start = rng.uniform(0.0, max(0.0, total - length))
+        end = start + length
+        cand = (round(start, 2), round(end, 2))
+        # no solape con margen 0.5s
+        solapa = False
+        for s, e in out:
+            if cand[0] < e - 0.5 and cand[1] > s + 0.5:
+                solapa = True
+                break
+        if not solapa:
+            out.append(cand)
+    return out
+
+
+
+def _select_targets(db: Session, limit: int = 5):
+    """Assets transcribed SIN candidate aprobado.
+
+    Orden: priority_tier desc, transcribed_at asc (los mas viejos primero).
+    """
+    return (
+        db.query(Asset)
+        .outerjoin(Candidate, (Candidate.asset_id == Asset.id) & (Candidate.status == "approved"))
+        .filter(Asset.status == "transcribed")
+        .filter(Candidate.id.is_(None))  # sin approved candidate
+        .filter(
+            ~Asset.extra_metadata.has_key("clip_selection_blocked")
+            | (Asset.extra_metadata["clip_selection_blocked"].astext != "true")
+        )
+        .order_by(Asset.transcribed_at.asc().nulls_last(), Asset.created_at.asc())
+        .limit(limit)
+        .all()
+    )
+
+
+def _ensure_candidates_for_asset(db: Session, asset: Asset, rules: dict) -> dict:
+    """Idempotent: si ya hay candidates, NO crea mas. Retorna resumen."""
+    if db.query(Candidate).filter(Candidate.asset_id == asset.id).count() > 0:
+        return {
+            "asset_id": str(asset.id),
+            "skipped": "already_have_candidates",
+            "created": 0,
+            "approved": 0,
+            "render_jobs_enqueued": 0,
+        }
+
+    N = _hearts(asset.duration_seconds or 0.0, rules.get("clips_per_asset"))
+
+    # 2026-09-18 (Molina): si la transcripcion esta vacia (video solo musica / sin
+    # dialogos) NO es un fallo. Generamos N candidatos aleatorios respetando
+    # duration_min/max de las reglas. No pasamos por el LLM.
+    if not _transcription_has_text(asset):
+        import uuid as _uuid
+        from app.models.candidate import Candidate as _C
+        rng_pairs = _build_random_candidates(asset, N, rules)
+        log.info(
+            "asset %s no transcript -> %d aleatorios: %s",
+            asset.id, len(rng_pairs),
+            [(round(s, 1), round(e, 1)) for s, e in rng_pairs],
+        )
+        created = []
+        for s, e in rng_pairs:
+            c = _C(
+                id=_uuid.uuid4(),
+                campaign_id=asset.campaign_id,
+                asset_id=asset.id,
+                start_time=s,
+                end_time=e,
+                score=0.5,
+                reasoning="auto-picked (no transcript available); random fallback 2026-09-18",
+                status="pending",
+                extra_metadata={
+                    "auto_approved": True,
+                    "auto_approved_by": "clip-decider-tick",
+                    "auto_approved_at": "",
+                    "selection_method": "random_no_transcript",
+                    "duration_min": rules.get("duration_min"),
+                    "duration_max": rules.get("duration_max"),
+                },
+            )
+            db.add(c)
+            created.append(c)
+        db.commit()
+        # auto-aprobarlos + encolar render
+        for c in created:
+            meta = dict(c.extra_metadata or {})
+            meta["auto_approved_at"] = datetime.now(timezone.utc).isoformat()
+            c.extra_metadata = meta
+            c.status = "approved"
+        db.commit()
+        render_jobs = []
+        for c in created:
+            try:
+                job = create_job(
+                    db,
+                    job_type="render",
+                    payload={
+                        "asset_id": str(asset.id),
+                        "candidate_id": str(c.id),
+                        "campaign_id": str(asset.campaign_id),
+                        "video": asset.local_path or asset.source_url,
+                        "source_url": asset.source_url,
+                        "start_time": float(c.start_time),
+                        "end_time": float(c.end_time),
+                        "destination": f"/tmp/cs_{asset.campaign_id}_{c.id}.mp4",
+                    },
+                    priority=5,
+                    max_attempts=2,
+                )
+                render_jobs.append(str(job.id))
+            except Exception as e:
+                log.exception("create_job(render) random failed: %s", e)
+        db.commit()
+        return {
+            "asset_id": str(asset.id),
+            "N": N,
+            "method": "random_no_transcript",
+            "approved_candidate_ids": [str(c.id) for c in created],
+            "render_jobs_enqueued": len(render_jobs),
+            "render_job_ids": render_jobs,
+        }
+
+    # Cliente LLM: por defecto HttpLLMClient (settings.anthropic_*). Mock si:
+    #   - env MOLINA_FORCE_MOCK_LLM=1
+    #   - no hay api_key (fallback seguro: 1 proposal mock mejor que reventar)
+    force_mock = os.environ.get("MOLINA_FORCE_MOCK_LLM") == "1"
+    if force_mock:
+        llm = MockLLMClient()
+    else:
+        try:
+            base_url = getattr(_settings, "anthropic_base_url", None) if _settings else None
+            model    = getattr(_settings, "anthropic_model", None)   if _settings else None
+            api_key  = getattr(_settings, "anthropic_api_key", None) if _settings else None
+            if not (base_url and model and api_key):
+                log.warning("LLMClient missing config (base_url=%s model=%s api_key_set=%s); using MockLLMClient fallback",
+                            bool(base_url), bool(model), bool(api_key))
+                llm = MockLLMClient()
+            else:
+                llm = HttpLLMClient(provider_url=base_url, model=model, api_key=api_key)
+        except Exception as _e:
+            log.warning("HttpLLMClient init failed (%s); using MockLLMClient fallback", _e)
+            llm = MockLLMClient()
+    agent = ClipSelectionAgent(llm_client=llm)
+    try:
+        result = agent.run(db, str(asset.id), top_n=N)
+    except Exception as e:
+        log.exception("agent.run failed asset=%s: %s", asset.id, e)
+        return {"asset_id": str(asset.id), "error": f"agent_failed: {e}"}
+
+    if not result.get("persisted"):
+        # LLM no dio nada util. Marcamos como blocked para no reintentar N ticks.
+        meta = dict(asset.extra_metadata or {})
+        meta["clip_selection_blocked"] = True
+        meta["clip_selection_last_error"] = result.get("error") or "no_proposals"
+        meta["clip_selection_last_at"] = datetime.now(timezone.utc).isoformat()
+        asset.extra_metadata = meta
+        db.commit()
+        return {
+            "asset_id": str(asset.id),
+            "blocked": True,
+            "reason": result.get("error") or "no_proposals",
+            "created": 0,
+            "approved": 0,
+        }
+
+    # Auto-aprobar los nuevos candidates (los que no tengan ya auto_approved)
+    new_cands = (
+        db.query(Candidate)
+        .filter(Candidate.asset_id == asset.id)
+        .filter(Candidate.status == "pending")
+        .all()
+    )
+    approved_ids = []
+    for c in new_cands:
+        meta = dict(c.extra_metadata or {})
+        meta["auto_approved"] = True
+        meta["auto_approved_by"] = "clip-decider-tick"
+        meta["auto_approved_at"] = datetime.now(timezone.utc).isoformat()
+        c.extra_metadata = meta
+        c.status = "approved"
+        approved_ids.append(str(c.id))
+    db.commit()
+
+    # Encolar render jobs (uno por candidate aprobado)
+    render_jobs = []
+    for cand in new_cands:
+        try:
+            job = create_job(
+                db,
+                job_type="render",
+                payload={
+                    "asset_id": str(asset.id),
+                    "candidate_id": str(cand.id),
+                    "campaign_id": str(asset.campaign_id),
+                    "video": asset.local_path or asset.source_url,
+                    "source_url": asset.source_url,
+                    "start_time": float(cand.start_time),
+                    "end_time": float(cand.end_time),
+                    "destination": f"/tmp/cs_{asset.campaign_id}_{cand.id}.mp4",
+                },
+                priority=5,
+                max_attempts=2,
+            )
+            render_jobs.append(str(job.id))
+        except Exception as e:
+            log.exception("create_job(render) failed for candidate %s: %s", cand.id, e)
+    db.commit()
+
+    # Marcar metadata del asset con el resumen del tick
+    meta = dict(asset.extra_metadata or {})
+    meta["clip_selection_at"] = datetime.now(timezone.utc).isoformat()
+    meta["clip_selection_N"] = N
+    meta["clip_selection_candidates_approved"] = len(approved_ids)
+    meta["clip_selection_render_jobs"] = len(render_jobs)
+    asset.extra_metadata = meta
+    db.commit()
+
+    return {
+        "asset_id": str(asset.id),
+        "N": N,
+        "approved_candidate_ids": approved_ids,
+        "render_jobs_enqueued": len(render_jobs),
+        "render_job_ids": render_jobs,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit", type=int, default=5)
+    ap.add_argument("--asset-id", default=None, help="run only for one asset (manual)")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args(argv)
+
+    t0 = time.time()
+    with SessionLocal() as db:
+        if args.asset_id:
+            asset = db.get(Asset, uuid.UUID(args.asset_id))
+            if asset is None:
+                log.error("asset_id not found: %s", args.asset_id)
+                return 2
+            camp = db.get(Campaign, asset.campaign_id)
+            rules = _resolve_rules(camp) if camp else DEFAULT_RULES
+            res = _ensure_candidates_for_asset(db, asset, rules)
+            log.info("manual run: %s", json.dumps(res, indent=2, default=str))
+            return 0
+
+        targets = _select_targets(db, limit=args.limit)
+        by_status: dict[str, int] = {}
+        approved = 0
+        render_jobs = 0
+        skipped = 0
+        errors = 0
+        per_asset: list[dict] = []
+
+        for asset in targets:
+            camp = db.get(Campaign, asset.campaign_id)
+            rules = _resolve_rules(camp) if camp else DEFAULT_RULES
+            if args.dry_run:
+                log.info("DRY-RUN asset=%s duration=%.1fs N=%d rules_keys=%s",
+                         asset.id, asset.duration_seconds or 0,
+                         _hearts(asset.duration_seconds or 0, rules.get("clips_per_asset")),
+                         sorted(rules.keys()))
+                continue
+            try:
+                res = _ensure_candidates_for_asset(db, asset, rules)
+            except Exception as e:
+                log.exception("asset=%s failed: %s", asset.id, e)
+                by_status["error"] = by_status.get("error", 0) + 1
+                errors += 1
+                continue
+            per_asset.append(res)
+            key = "blocked" if res.get("blocked") else (
+                "skipped" if res.get("skipped") else "approved")
+            by_status[key] = by_status.get(key, 0) + 1
+            if key == "approved":
+                approved += int(res.get("approved_candidate_ids") and len(res["approved_candidate_ids"]) or 0)
+                render_jobs += int(res.get("render_jobs_enqueued") or 0)
+            elif key == "skipped":
+                skipped += 1
+
+        duration_ms = int((time.time() - t0) * 1000)
+
+    summary = {
+        "scanned": len(targets),
+        "approved_candidates": approved,
+        "skipped": skipped,
+        "errors": errors,
+        "render_jobs_enqueued": render_jobs,
+        "by_status": by_status,
+        "duration_ms": duration_ms,
+    }
+    log.info("clip-decider-tick: scanned=%d approved_candidates=%d skipped=%d errors=%d render_jobs_enqueued=%d duration_ms=%d by_status=%s",
+             summary["scanned"], summary["approved_candidates"],
+             summary["skipped"], summary["errors"], summary["render_jobs_enqueued"],
+             summary["duration_ms"], summary["by_status"])
+    if args.dry_run:
+        log.info("DRY-RUN completed (no DB writes).")
+    print(json.dumps(summary, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

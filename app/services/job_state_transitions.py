@@ -101,18 +101,42 @@ def on_download_completed(
     db.refresh(asset)
 
     # Auto-create transcribe job
+    # 2026-09-18 (Molina): el Worker a veces escribe el archivo descargado
+    # con extension `.bin` o `application/octet-stream` aunque la URL fuera
+    # un .mp4/.mov. WhisperX revienta al intentar abrir eso. Validamos el
+    # formato reportado antes de crear el transcribe; si es invalido,
+    # marcamos el asset como terminal failed (no se reintenta, no bloquea).
+    from app.services.download_payload_validation import (
+        validate_download_result, MediaFormatInvalid,
+    )
     try:
-        # Worker contract: transcribe requires `video` (or legacy `video_path`).
-        # Usamos `asset.local_path` que acabamos de actualizar desde el result.
-        # Fallback a source_url solo si el Worker no devolvió `file_path` (job
-        # legacy o Worker que aún no soporta el canon) — el Worker fallará
-        # ruidosamente en ese caso, mejor que un silencio.
+        validate_download_result(
+            file_path=asset.local_path,
+            mime_type=asset.mime_type,
+            result_data=result_data,
+        )
+    except MediaFormatInvalid as e:
+        meta = dict(asset.extra_metadata or {})
+        meta["skip_download"] = True
+        meta["last_error_kind"] = "unsupported_media_format"
+        meta["last_error_detail"] = str(e)[:500]
+        meta["terminal_failed_at"] = _now().isoformat()
+        meta["file_path_reported"] = (asset.local_path or "")[:500]
+        asset.extra_metadata = meta
+        _update_asset_status(db, asset, AssetStatus.FAILED.value)
+        logger.warning(
+            "asset %s NOT transcribed: invalid media format (%s) file_path=%s mime=%s",
+            asset.id, e, asset.local_path, asset.mime_type,
+        )
+        return
+
+    try:
         transcribe_payload = {
             "asset_id": str(asset.id),
             "campaign_id": str(asset.campaign_id),
             "video": asset.local_path or asset.source_url,
-            "video_path": asset.local_path or asset.source_url,  # alias
-            "source_url": asset.source_url,                       # backwards-compat
+            "video_path": asset.local_path or asset.source_url,
+            "source_url": asset.source_url,
             "language": (asset.extra_metadata or {}).get("language"),
         }
         create_job(
@@ -371,20 +395,96 @@ def on_qa_completed(
     return clip
 
 
+# 2026-09-18 (Molina): kinds de error terminales. Cuando un job de download
+# falla con uno de estos, el asset NO es un vídeo descargable (canal YouTube,
+# perfil Instagram, 404, página HTML). Lo marcamos con skip_download=True
+# para que el download-enqueue-tick no lo reencole en el siguiente barrido.
+# Transient (network_timeout, 5xx, etc.) NO aparece aquí -> sigue reintentando.
+TERMINAL_ERROR_KINDS = frozenset({
+    "not_a_video",
+    "youtube_channel",
+    "youtube_playlist",
+    "instagram_profile",
+    "instagram_story_unavailable",
+    "instagram_post_unavailable",
+    "tiktok_account",
+    "channel_page",
+    "404_not_found",
+    "403_forbidden",
+    "external_404",
+    "external_non_video",
+    "page_not_video",
+    "html_instead_of_media",
+    "media_too_small",
+})
+
+
+def _classify_job_error(job: Job) -> tuple[str | None, str | None]:
+    """Lee (error_kind, error_detail) del result del job o de error_message.
+
+    Convención Worker: el `result` puede traer
+    `{"error": {"kind": "youtube_channel", "detail": "..."}}` o
+    `{"kind": "...", "detail": "..."}`. Si no, parsea prefijos en
+    `error_message`.
+    """
+    result = job.result if isinstance(job.result, dict) else {}
+    err = result.get("error") if isinstance(result.get("error"), dict) else result
+    kind = err.get("kind") if isinstance(err, dict) else None
+    detail = err.get("detail") if isinstance(err, dict) else None
+    if not kind and job.error_message:
+        em = str(job.error_message)
+        for k in TERMINAL_ERROR_KINDS:
+            if em.startswith(k):
+                return k, em
+    return (str(kind) if kind else None, detail)
+
+
 def on_job_failed(db: Session, job: Job) -> None:
-    """If a job fails, mark the related asset as 'failed' (only if the
-    asset was related to a download/transcribe that was its first attempt)."""
+    """If a job fails, mark the related asset as 'failed'.
+
+    2026-09-18 (Molina): si el error es terminal (canal/perfil/404/etc),
+    además pone skip_download=true y guarda last_error_kind en
+    asset.extra_metadata. Asi el download-enqueue-tick lo cuenta como
+    skipped_terminal_error en cada barrido y la campaña NO se bloquea.
+    """
     asset_id = _asset_id_from_payload(job.payload or {})
     if not asset_id:
         return
     asset = db.get(Asset, uuid.UUID(asset_id))
     if asset is None:
         return
-    if asset.status in (
+    if asset.status not in (
         AssetStatus.PENDING.value,
         AssetStatus.DOWNLOADED.value,
     ):
-        asset.status = AssetStatus.FAILED.value
-        db.commit()
-        db.refresh(asset)
-        logger.info("asset %s marked failed (job %s)", asset.id, job.id)
+        return
+
+    error_kind, error_detail = _classify_job_error(job)
+    asset.status = AssetStatus.FAILED.value
+
+    meta = dict(asset.extra_metadata or {})
+    if error_kind and error_kind in TERMINAL_ERROR_KINDS:
+        meta["skip_download"] = True
+        meta["last_error_kind"] = error_kind
+        meta["last_error_detail"] = (error_detail or "")[:500]
+        meta["terminal_failed_at"] = _now().isoformat()
+        asset.extra_metadata = meta
+        logger.warning(
+            "asset %s marked failed (terminal error_kind=%s) by job %s",
+            asset.id, error_kind, job.id,
+        )
+    else:
+        # Error transient: failed a nivel job, NO skip_download.
+        if meta.get("last_error_kind"):
+            meta.pop("skip_download", None)
+            meta.pop("last_error_kind", None)
+            meta.pop("last_error_detail", None)
+            meta.pop("terminal_failed_at", None)
+            asset.extra_metadata = meta
+        logger.info(
+            "asset %s marked failed (transient error_kind=%s) by job %s",
+            asset.id, error_kind, job.id,
+        )
+
+    db.commit()
+    db.refresh(asset)

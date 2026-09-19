@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Paso 3c — campaign scorer. Deterministic. No LLM. No OpenClaw.
-
-Reads campaigns in assets_resolved, counts real video assets, writes score,
-sets status scored | blocked_no_assets. Score < 50 → blocked_no_assets.
-
-    python scripts/campaign_scorer_tick.py --dry-run
-    python scripts/campaign_scorer_tick.py --limit 1
-"""
+"""Paso 3c — campaign scorer. Deterministic. No LLM."""
 from __future__ import annotations
 
 import argparse
@@ -34,6 +27,23 @@ def _is_real_asset(asset) -> bool:
     if "/drive/folders/" in url or "/document/d/" in url:
         return False
     return True
+
+
+def _size_of(asset) -> int:
+    if asset.file_size:
+        try:
+            return int(asset.file_size)
+        except (TypeError, ValueError):
+            pass
+    meta = asset.extra_metadata or {}
+    for k in ("file_size", "size"):
+        v = meta.get(k)
+        if v:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                pass
+    return 0
 
 
 def _cpm_usd(meta: dict) -> float:
@@ -81,6 +91,7 @@ def main() -> int:
         for c in rows:
             assets = db.query(Asset).filter(Asset.campaign_id == c.id).all()
             real = [a for a in assets if _is_real_asset(a)]
+            sizes = [_size_of(a) for a in real]
             meta = dict(c.source_metadata or {})
             discovered = dict(meta.get("discovered") or {})
             rules = dict(meta.get("rules") or {})
@@ -97,6 +108,7 @@ def main() -> int:
                 verified=verified,
                 rules=rules,
                 content_kinds=rules.get("content_source_kinds"),
+                file_sizes=sizes,
             )
             score = scored["value"]
             if not real:

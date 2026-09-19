@@ -58,7 +58,6 @@ def _asset_id_from_payload(payload: dict) -> Optional[str]:
     """Read asset_id from job payload. Returns None if not present."""
     val = payload.get("asset_id") if isinstance(payload, dict) else None
     if not val:
-        # Some flows may put it under different key
         val = payload.get("source_asset_id") if isinstance(payload, dict) else None
     return val
 
@@ -86,7 +85,6 @@ def on_download_completed(
 
     _update_asset_status(db, asset, AssetStatus.DOWNLOADED.value)
 
-    # Update asset local_path / file_size / duration if present in result
     if "file_path" in result_data:
         asset.local_path = result_data["file_path"]
     if "file_size" in result_data:
@@ -100,23 +98,21 @@ def on_download_completed(
     db.commit()
     db.refresh(asset)
 
-    # Auto-create transcribe job
-    # 2026-09-18 (Molina): el Worker a veces escribe el archivo descargado
-    # con extension `.bin` o `application/octet-stream` aunque la URL fuera
-    # un .mp4/.mov. WhisperX revienta al intentar abrir eso. Validamos el
-    # formato reportado antes de crear el transcribe; si es invalido,
-    # marcamos el asset como terminal failed (no se reintenta, no bloquea).
+    # Worker HTTP downloads are stored as <job_id>.bin on purpose.
+    # Reject only when there is no signal that the bytes are media.
     from app.services.download_payload_validation import (
         validate_download_result, MediaFormatInvalid,
     )
+    meta = dict(asset.extra_metadata or {})
     try:
         validate_download_result(
             file_path=asset.local_path,
-            mime_type=asset.mime_type,
+            mime_type=asset.mime_type or meta.get("mime_type"),
             result_data=result_data,
+            kind=meta.get("kind"),
+            source_name=meta.get("name"),
         )
     except MediaFormatInvalid as e:
-        meta = dict(asset.extra_metadata or {})
         meta["skip_download"] = True
         meta["last_error_kind"] = "unsupported_media_format"
         meta["last_error_detail"] = str(e)[:500]
@@ -137,7 +133,7 @@ def on_download_completed(
             "video": asset.local_path or asset.source_url,
             "video_path": asset.local_path or asset.source_url,
             "source_url": asset.source_url,
-            "language": (asset.extra_metadata or {}).get("language"),
+            "language": meta.get("language"),
         }
         create_job(
             db,
@@ -157,11 +153,7 @@ def on_download_completed(
 def on_transcribe_completed(
     db: Session, job: Job, result_data: dict
 ) -> None:
-    """Step 11: transcribe job completed successfully.
-
-    - Mark asset.status = 'transcribed'
-    - Store transcription in asset.extra_metadata (so OpenClaw can read it in step 12-13)
-    """
+    """Step 11: transcribe job completed successfully."""
     asset_id = _asset_id_from_payload(job.payload or {})
     if not asset_id:
         logger.warning(
@@ -177,7 +169,6 @@ def on_transcribe_completed(
 
     _update_asset_status(db, asset, AssetStatus.TRANSCRIBED.value)
 
-    # Store transcription under extra_metadata['transcription']
     meta = dict(asset.extra_metadata or {})
     meta["transcription"] = result_data
     asset.extra_metadata = meta
@@ -185,7 +176,6 @@ def on_transcribe_completed(
     db.refresh(asset)
     logger.info("transcription stored for asset %s", asset.id)
 
-    # --- Auto clip_selection (fix cuello de botella asset->candidate) ---
     try:
         from app.clip_selection.agent import ClipSelectionAgent
         agent = ClipSelectionAgent()
@@ -198,12 +188,7 @@ def on_transcribe_completed(
 def on_render_completed(
     db: Session, job: Job, result_data: dict
 ) -> tuple[Optional[Clip], Optional[Job]]:
-    """Step 17: render job completed successfully.
-
-    - Create a Clip record from the result
-    - Auto-create a QA job for the new clip
-    Returns (clip, qa_job) for the caller to use.
-    """
+    """Step 17: render job completed successfully."""
     asset_id = _asset_id_from_payload(job.payload or {})
     if not asset_id:
         logger.warning(
@@ -223,7 +208,6 @@ def on_render_completed(
         if cand:
             try:
                 cand_uuid = uuid.UUID(cand)
-                # Validate the candidate exists in DB; ignore if not
                 from app.models.candidate import Candidate
                 if db.get(Candidate, cand_uuid) is not None:
                     candidate_id = cand_uuid
@@ -247,27 +231,18 @@ def on_render_completed(
     db.refresh(clip)
     logger.info("clip %s created from render %s", clip.id, job.id)
 
-    # Auto-create QA job
     qa_job: Optional[Job] = None
     try:
-        # Build QA rules from campaign.spec (Step 3 architecture_flow.md):
-        #   - Technical rules (width/height/min_fps/require_audio/codec) live in
-        #     spec.extra["qa_rules"] (OpenClaw/MiniMax populated when generating the spec).
-        #   - Duration window (spec.duration_min/max) is fused into rules.min_duration/
-        #     max_duration so the QA Worker enforces the same window the campaign wants
-        #     semantically. No redundant fields.
         qa_rules: dict[str, Any] = {}
         try:
             from app.models.campaign import Campaign
             campaign = db.get(Campaign, asset.campaign_id)
             if campaign is not None and isinstance(campaign.spec, dict):
                 spec = campaign.spec
-                # Duration window fused from CampaignSpec
                 if spec.get("duration_min") is not None:
                     qa_rules["min_duration"] = float(spec["duration_min"])
                 if spec.get("duration_max") is not None:
                     qa_rules["max_duration"] = float(spec["duration_max"])
-                # Technical rules from spec.extra["qa_rules"]
                 extra = spec.get("extra") or {}
                 if isinstance(extra, dict):
                     extra_qa = extra.get("qa_rules") or {}
@@ -291,6 +266,7 @@ def on_render_completed(
         qa_payload: dict[str, Any] = {
             "clip_id": str(clip.id),
             "asset_id": str(asset.id),
+            "campaign_id": str(asset.campaign_id),
             "file_path": clip.file_path,
         }
         if qa_rules:
@@ -315,12 +291,7 @@ def on_render_completed(
 def on_qa_completed(
     db: Session, job: Job, result_data: dict
 ) -> Optional[Clip]:
-    """Step 19: QA job completed successfully.
-
-    - Update clip.qa_status from result_data['status']
-    - Store qa_result
-    - Update clip.status accordingly (pass->approved, fail->rejected, review->review)
-    """
+    """Step 19: QA job completed successfully."""
     clip_id = None
     if isinstance(job.payload, dict):
         clip_id = job.payload.get("clip_id")
@@ -342,7 +313,6 @@ def on_qa_completed(
         return None
 
     raw_status = (result_data.get("status") or "review").lower()
-    # normalize
     if raw_status in ("pass", "passed", "ok"):
         qa_status = ClipQAStatus.PASS.value
     elif raw_status in ("fail", "failed", "error"):
@@ -368,12 +338,6 @@ def on_qa_completed(
         "clip %s qa=%s status=%s", clip.id, qa_status, clip.status,
     )
 
-    # ── Step 18: QA pass -> clip lives in pending_upload/ ──
-    # The Worker copies the .mp4 to <storage>/clips/<campaign>/pending_upload/
-    # and reports the new path via `result_data["final_path_worker"]`.
-    # We just record it. If the Worker hasn't reported yet (legacy flow),
-    # we still stamp `location='pending_upload'` so the clip is visible in
-    # the per-campaign folder listing.
     if qa_status == ClipQAStatus.PASS.value:
         try:
             from app.services.clip_storage_service import set_clip_location
@@ -386,7 +350,6 @@ def on_qa_completed(
                 clip.id, final_path,
             )
         except Exception as e:  # noqa: BLE001
-            # Never fail the QA handler because of step 18 — log and continue.
             logger.exception(
                 "clip %s step18: failed to set pending_upload location: %s",
                 clip.id, e,
@@ -395,11 +358,6 @@ def on_qa_completed(
     return clip
 
 
-# 2026-09-18 (Molina): kinds de error terminales. Cuando un job de download
-# falla con uno de estos, el asset NO es un vídeo descargable (canal YouTube,
-# perfil Instagram, 404, página HTML). Lo marcamos con skip_download=True
-# para que el download-enqueue-tick no lo reencole en el siguiente barrido.
-# Transient (network_timeout, 5xx, etc.) NO aparece aquí -> sigue reintentando.
 TERMINAL_ERROR_KINDS = frozenset({
     "not_a_video",
     "youtube_channel",
@@ -420,13 +378,6 @@ TERMINAL_ERROR_KINDS = frozenset({
 
 
 def _classify_job_error(job: Job) -> tuple[str | None, str | None]:
-    """Lee (error_kind, error_detail) del result del job o de error_message.
-
-    Convención Worker: el `result` puede traer
-    `{"error": {"kind": "youtube_channel", "detail": "..."}}` o
-    `{"kind": "...", "detail": "..."}`. Si no, parsea prefijos en
-    `error_message`.
-    """
     result = job.result if isinstance(job.result, dict) else {}
     err = result.get("error") if isinstance(result.get("error"), dict) else result
     kind = err.get("kind") if isinstance(err, dict) else None
@@ -440,13 +391,6 @@ def _classify_job_error(job: Job) -> tuple[str | None, str | None]:
 
 
 def on_job_failed(db: Session, job: Job) -> None:
-    """If a job fails, mark the related asset as 'failed'.
-
-    2026-09-18 (Molina): si el error es terminal (canal/perfil/404/etc),
-    además pone skip_download=true y guarda last_error_kind en
-    asset.extra_metadata. Asi el download-enqueue-tick lo cuenta como
-    skipped_terminal_error en cada barrido y la campaña NO se bloquea.
-    """
     asset_id = _asset_id_from_payload(job.payload or {})
     if not asset_id:
         return
@@ -474,7 +418,6 @@ def on_job_failed(db: Session, job: Job) -> None:
             asset.id, error_kind, job.id,
         )
     else:
-        # Error transient: failed a nivel job, NO skip_download.
         if meta.get("last_error_kind"):
             meta.pop("skip_download", None)
             meta.pop("last_error_kind", None)

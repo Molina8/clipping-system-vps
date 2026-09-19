@@ -52,19 +52,14 @@ def on_download_completed(
 ) -> None:
     asset_id = _asset_id_from_payload(job.payload or {})
     if not asset_id:
-        logger.warning(
-            "download job %s completed but no asset_id in payload",
-            job.id,
-        )
+        logger.warning("download job %s completed but no asset_id in payload", job.id)
         return
-
     asset = db.get(Asset, uuid.UUID(asset_id))
     if asset is None:
         logger.warning("download job %s: asset %s not found", job.id, asset_id)
         return
 
     _update_asset_status(db, asset, AssetStatus.DOWNLOADED.value)
-
     if "file_path" in result_data:
         asset.local_path = result_data["file_path"]
     if "file_size" in result_data:
@@ -105,25 +100,21 @@ def on_download_completed(
         return
 
     try:
-        transcribe_payload = {
-            "asset_id": str(asset.id),
-            "campaign_id": str(asset.campaign_id),
-            "video": asset.local_path or asset.source_url,
-            "video_path": asset.local_path or asset.source_url,
-            "source_url": asset.source_url,
-            "language": meta.get("language"),
-        }
         create_job(
             db,
             job_type="transcribe",
-            payload=transcribe_payload,
+            payload={
+                "asset_id": str(asset.id),
+                "campaign_id": str(asset.campaign_id),
+                "video": asset.local_path or asset.source_url,
+                "video_path": asset.local_path or asset.source_url,
+                "source_url": asset.source_url,
+                "language": meta.get("language"),
+            },
             priority=job.priority,
             max_attempts=job.max_attempts,
         )
-        logger.info(
-            "auto-created transcribe job for asset %s (download %s done)",
-            asset.id, job.id,
-        )
+        logger.info("auto-created transcribe job for asset %s (download %s done)", asset.id, job.id)
     except Exception as e:  # noqa: BLE001
         logger.exception("failed to auto-create transcribe job: %s", e)
 
@@ -131,28 +122,29 @@ def on_download_completed(
 def on_transcribe_completed(
     db: Session, job: Job, result_data: dict
 ) -> None:
-    """Store transcript only. Clip selection is a separate explicit step."""
     asset_id = _asset_id_from_payload(job.payload or {})
     if not asset_id:
-        logger.warning(
-            "transcribe job %s completed but no asset_id in payload",
-            job.id,
-        )
+        logger.warning("transcribe job %s completed but no asset_id in payload", job.id)
         return
-
     asset = db.get(Asset, uuid.UUID(asset_id))
     if asset is None:
         logger.warning("transcribe job %s: asset %s not found", job.id, asset_id)
         return
 
     _update_asset_status(db, asset, AssetStatus.TRANSCRIBED.value)
-
     meta = dict(asset.extra_metadata or {})
     meta["transcription"] = result_data
     asset.extra_metadata = meta
     db.commit()
     db.refresh(asset)
-    logger.info("transcription stored for asset %s (no auto clip_selection)", asset.id)
+    logger.info("transcription stored for asset %s", asset.id)
+
+    try:
+        from app.services.silent_clip_cutter import maybe_cut_silent
+        cut = maybe_cut_silent(db, asset)
+        logger.info("post-transcribe clip route asset=%s %s", asset.id, cut)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("silent cut failed asset %s: %s", asset.id, e)
 
 
 def on_render_completed(
@@ -160,15 +152,9 @@ def on_render_completed(
 ) -> tuple[Optional[Clip], Optional[Job]]:
     asset_id = _asset_id_from_payload(job.payload or {})
     if not asset_id:
-        logger.warning(
-            "render job %s completed but no asset_id in payload",
-            job.id,
-        )
         return None, None
-
     asset = db.get(Asset, uuid.UUID(asset_id))
     if asset is None:
-        logger.warning("render job %s: asset %s not found", job.id, asset_id)
         return None, None
 
     candidate_id = None
@@ -198,7 +184,6 @@ def on_render_completed(
     db.add(clip)
     db.commit()
     db.refresh(clip)
-    logger.info("clip %s created from render %s", clip.id, job.id)
 
     qa_job: Optional[Job] = None
     try:
@@ -216,21 +201,11 @@ def on_render_completed(
                 if isinstance(extra, dict):
                     extra_qa = extra.get("qa_rules") or {}
                     if isinstance(extra_qa, dict):
-                        for key in (
-                            "width",
-                            "height",
-                            "min_fps",
-                            "require_audio",
-                            "codec",
-                        ):
+                        for key in ("width", "height", "min_fps", "require_audio", "codec"):
                             if key in extra_qa:
                                 qa_rules[key] = extra_qa[key]
         except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "could not load QA rules from campaign %s: %s",
-                getattr(asset, "campaign_id", None),
-                e,
-            )
+            logger.warning("could not load QA rules from campaign %s: %s", asset.campaign_id, e)
 
         qa_payload: dict[str, Any] = {
             "clip_id": str(clip.id),
@@ -240,44 +215,24 @@ def on_render_completed(
         }
         if qa_rules:
             qa_payload["rules"] = qa_rules
-        qa_job = create_job(
-            db,
-            job_type="qa",
-            payload=qa_payload,
-            priority=job.priority,
-            max_attempts=job.max_attempts,
-        )
+        qa_job = create_job(db, job_type="qa", payload=qa_payload, priority=job.priority, max_attempts=job.max_attempts)
         clip.qa_job_id = qa_job.id
         db.commit()
         db.refresh(clip)
-        logger.info("auto-created qa job %s for clip %s", qa_job.id, clip.id)
     except Exception as e:  # noqa: BLE001
         logger.exception("failed to auto-create qa job: %s", e)
-
     return clip, qa_job
 
 
-def on_qa_completed(
-    db: Session, job: Job, result_data: dict
-) -> Optional[Clip]:
-    clip_id = None
-    if isinstance(job.payload, dict):
-        clip_id = job.payload.get("clip_id")
+def on_qa_completed(db: Session, job: Job, result_data: dict) -> Optional[Clip]:
+    clip_id = job.payload.get("clip_id") if isinstance(job.payload, dict) else None
     if not clip_id:
-        logger.warning(
-            "qa job %s completed but no clip_id in payload",
-            job.id,
-        )
         return None
-
     try:
-        clip_uuid = uuid.UUID(clip_id)
+        clip = db.get(Clip, uuid.UUID(clip_id))
     except (TypeError, ValueError):
         return None
-
-    clip = db.get(Clip, clip_uuid)
     if clip is None:
-        logger.warning("qa job %s: clip %s not found", job.id, clip_id)
         return None
 
     raw_status = (result_data.get("status") or "review").lower()
@@ -287,57 +242,32 @@ def on_qa_completed(
         qa_status = ClipQAStatus.FAIL.value
     else:
         qa_status = ClipQAStatus.REVIEW.value
-
     clip.qa_status = qa_status
     clip.qa_result = result_data
     clip.qa_at = _now()
-
     if qa_status == ClipQAStatus.PASS.value:
         clip.status = ClipStatus.APPROVED.value
     elif qa_status == ClipQAStatus.FAIL.value:
         clip.status = ClipStatus.REJECTED.value
     else:
         clip.status = ClipStatus.REVIEW.value
-
     clip.qa_job_id = job.id
     db.commit()
     db.refresh(clip)
-    logger.info(
-        "clip %s qa=%s status=%s", clip.id, qa_status, clip.status,
-    )
-
     if qa_status == ClipQAStatus.PASS.value:
         try:
             from app.services.clip_storage_service import set_clip_location
-            final_path = None
-            if isinstance(result_data, dict):
-                final_path = result_data.get("final_path_worker")
-            set_clip_location(db, clip.id, "pending_upload", final_path_worker=final_path)
+            set_clip_location(db, clip.id, "pending_upload", final_path_worker=(result_data or {}).get("final_path_worker"))
         except Exception as e:  # noqa: BLE001
-            logger.exception(
-                "clip %s step18: failed to set pending_upload location: %s",
-                clip.id, e,
-            )
-
+            logger.exception("clip %s step18 failed: %s", clip.id, e)
     return clip
 
 
 TERMINAL_ERROR_KINDS = frozenset({
-    "not_a_video",
-    "youtube_channel",
-    "youtube_playlist",
-    "instagram_profile",
-    "instagram_story_unavailable",
-    "instagram_post_unavailable",
-    "tiktok_account",
-    "channel_page",
-    "404_not_found",
-    "403_forbidden",
-    "external_404",
-    "external_non_video",
-    "page_not_video",
-    "html_instead_of_media",
-    "media_too_small",
+    "not_a_video", "youtube_channel", "youtube_playlist", "instagram_profile",
+    "instagram_story_unavailable", "instagram_post_unavailable", "tiktok_account",
+    "channel_page", "404_not_found", "403_forbidden", "external_404",
+    "external_non_video", "page_not_video", "html_instead_of_media", "media_too_small",
 })
 
 
@@ -361,15 +291,10 @@ def on_job_failed(db: Session, job: Job) -> None:
     asset = db.get(Asset, uuid.UUID(asset_id))
     if asset is None:
         return
-    if asset.status not in (
-        AssetStatus.PENDING.value,
-        AssetStatus.DOWNLOADED.value,
-    ):
+    if asset.status not in (AssetStatus.PENDING.value, AssetStatus.DOWNLOADED.value):
         return
-
     error_kind, error_detail = _classify_job_error(job)
     asset.status = AssetStatus.FAILED.value
-
     meta = dict(asset.extra_metadata or {})
     if error_kind and error_kind in TERMINAL_ERROR_KINDS:
         meta["skip_download"] = True
@@ -377,21 +302,10 @@ def on_job_failed(db: Session, job: Job) -> None:
         meta["last_error_detail"] = (error_detail or "")[:500]
         meta["terminal_failed_at"] = _now().isoformat()
         asset.extra_metadata = meta
-        logger.warning(
-            "asset %s marked failed (terminal error_kind=%s) by job %s",
-            asset.id, error_kind, job.id,
-        )
-    else:
-        if meta.get("last_error_kind"):
-            meta.pop("skip_download", None)
-            meta.pop("last_error_kind", None)
-            meta.pop("last_error_detail", None)
-            meta.pop("terminal_failed_at", None)
-            asset.extra_metadata = meta
-        logger.info(
-            "asset %s marked failed (transient error_kind=%s) by job %s",
-            asset.id, error_kind, job.id,
-        )
-
+    elif meta.get("last_error_kind"):
+        meta.pop("skip_download", None)
+        meta.pop("last_error_kind", None)
+        meta.pop("last_error_detail", None)
+        meta.pop("terminal_failed_at", None)
+        asset.extra_metadata = meta
     db.commit()
-    db.refresh(asset)

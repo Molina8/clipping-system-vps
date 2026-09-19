@@ -26,6 +26,7 @@ def main() -> int:
     args = p.parse_args()
 
     from app.db.database import SessionLocal
+    from app.models.campaign import Campaign  # noqa: F401
     from app.models.asset import Asset
     from app.models.job import Job
     from app.services.job_service import create_job
@@ -46,7 +47,7 @@ def main() -> int:
             meta = dict(asset.extra_metadata or {})
             detail = (meta.get("last_error_kind") or "")
             path = asset.local_path or meta.get("file_path_reported") or ""
-            if detail != "unsupported_media_format" and ".bin" not in path:
+            if detail != "unsupported_media_format" and ".bin" not in str(path):
                 skipped += 1
                 continue
             if not path:
@@ -62,7 +63,7 @@ def main() -> int:
             if existing is not None:
                 skipped += 1
                 continue
-            print(f"requeue asset={asset.id} path={path[:80]}")
+            print(f"requeue asset={asset.id} path={str(path)[:80]}")
             if args.dry_run:
                 created += 1
                 continue
@@ -93,6 +94,9 @@ def main() -> int:
             db.commit()
         print(f"requeue_transcribe_stalled created={created} skipped={skipped} dry_run={args.dry_run}")
         return 0
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 

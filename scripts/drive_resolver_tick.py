@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""Paso 3b — expand Google Drive folders into file assets. Recurse 2 levels.
+"""Paso 3b — un solo resolver, varios backends (Drive, Dropbox file, URL directa).
 
-Only Drive (gog). Dropbox has its own tick if/when enabled.
-MediaSilo / WeTransfer / etc. → failed_resolve and stay there.
+Cron path kept as drive_resolver_tick.py.
 """
 from __future__ import annotations
 
 import argparse
-import json
-import os
-import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -22,94 +17,7 @@ try:
 except Exception:
     pass
 
-FOLDER_RE = re.compile(r"/folders/([a-zA-Z0-9_-]+)")
-VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
-FOLDER_MIME = "application/vnd.google-apps.folder"
-SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
-MAX_DEPTH = 2
-MAX_FILES = 12
 _RETRYABLE = {"gog", "gog_error"}
-
-
-def _folder_id(url: str) -> str | None:
-    m = FOLDER_RE.search(url or "")
-    return m.group(1) if m else None
-
-
-def _gog_env() -> dict:
-    env = dict(os.environ)
-    if not env.get("GOG_KEYRING_PASSWORD") and Path("/etc/openclaw/cron-secrets.env").exists():
-        for line in Path("/etc/openclaw/cron-secrets.env").read_text().splitlines():
-            if line.startswith("GOG_KEYRING_PASSWORD="):
-                env["GOG_KEYRING_PASSWORD"] = line.split("=", 1)[1].strip().strip('"')
-    return env
-
-
-def _parse_gog_json(out: str) -> list[dict]:
-    data = json.loads(out)
-    if isinstance(data, list):
-        return [x for x in data if isinstance(x, dict)]
-    if not isinstance(data, dict):
-        return []
-    val = data.get("files") or data.get("items") or []
-    return [x for x in val if isinstance(x, dict)] if isinstance(val, list) else []
-
-
-def _gog_ls(folder_id: str) -> list[dict]:
-    env = _gog_env()
-    cmd = ["gog", "drive", "ls", "--parent", folder_id, "--json", "--max", "100"]
-    if env.get("GOG_ACCOUNT"):
-        cmd[3:3] = ["--account", env["GOG_ACCOUNT"]]
-    p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=90)
-    if p.returncode != 0:
-        raise RuntimeError((p.stderr or p.stdout or "gog failed")[:400])
-    return _parse_gog_json((p.stdout or "").strip() or "{}")
-
-
-def _walk(folder_id: str, depth: int, seen: set[str]) -> list[dict]:
-    if not folder_id or folder_id in seen or depth > MAX_DEPTH:
-        return []
-    seen.add(folder_id)
-    rows = _gog_ls(folder_id)
-    out = []
-    for item in rows:
-        mime = str(item.get("mimeType") or "")
-        fid = str(item.get("id") or "")
-        if mime == FOLDER_MIME and depth < MAX_DEPTH:
-            out.extend(_walk(fid, depth + 1, seen))
-        elif mime == SHORTCUT_MIME:
-            details = item.get("shortcutDetails") or {}
-            tid = details.get("targetId")
-            tmime = details.get("targetMimeType") or ""
-            if tmime == FOLDER_MIME and depth < MAX_DEPTH:
-                out.extend(_walk(str(tid), depth + 1, seen))
-            elif tid:
-                item = dict(item)
-                item["id"] = tid
-                item["mimeType"] = tmime or mime
-                out.append(item)
-        else:
-            out.append(item)
-        if len(out) >= MAX_FILES:
-            break
-    return out[:MAX_FILES]
-
-
-def _is_video(item: dict) -> bool:
-    mime = str(item.get("mimeType") or "")
-    name = str(item.get("name") or "")
-    if mime.startswith("video/"):
-        return True
-    return Path(name).suffix.lower() in VIDEO_EXT
-
-
-def _kind_from_name(name: str) -> str:
-    ext = Path(name or "").suffix.lower()
-    return ext.lstrip(".") if ext in VIDEO_EXT else "video"
-
-
-def _uc(file_id: str) -> str:
-    return f"https://drive.google.com/uc?export=download&id={file_id}"
 
 
 def _candidate_urls(campaign) -> list[str]:
@@ -149,6 +57,7 @@ def main() -> int:
     from app.models.asset import Asset
     from app.schemas.asset import AssetCreate
     from app.services.asset_service import create_asset
+    from app.services.asset_resolve import expand_all
 
     db = SessionLocal()
     created = resolved = 0
@@ -163,51 +72,33 @@ def main() -> int:
                 .limit(args.limit)
                 .all()
             )
-        print(f"drive_resolver_tick scanned={len(camps)} dry_run={args.dry_run}")
+        print(f"asset_resolver_tick scanned={len(camps)} dry_run={args.dry_run}")
         for c in camps:
             meta = dict(c.source_metadata or {})
             prev = (meta.get("resolve_error") or {}).get("kind")
-            if c.status == "failed_resolve" and prev not in _RETRYABLE:
+            if c.status == "failed_resolve" and prev not in _RETRYABLE and not args.campaign_id:
                 print(f"campaign={c.id} skip stuck failed_resolve kind={prev}")
                 continue
-            urls = _candidate_urls(c)
             existing = db.query(Asset).filter(Asset.campaign_id == c.id).all()
             if c.status == "assets_resolved" and any(
-                (a.extra_metadata or {}).get("kind") not in {"drive_folder", "brand_asset"} for a in existing
+                (a.extra_metadata or {}).get("kind") not in {"drive_folder", "brand_asset", "brief_doc"}
+                for a in existing
             ):
                 print(f"campaign={c.id} skip already has files")
                 continue
+            urls = _candidate_urls(c)
+            print(f"campaign={c.id} urls={len(urls)}")
+            items, errors = expand_all(urls)
             existing_ids = {a.source_id for a in existing if a.source_id}
-            roots = []
-            for url in urls:
-                fid = _folder_id(url)
-                if fid and fid not in roots:
-                    roots.append(fid)
-            if not roots:
-                msg = "no Drive/Dropbox folder; sources=" + ", ".join(urls[:6])
-                print(f"campaign={c.id} failed_resolve unsupported_source {msg}")
-                if not args.dry_run:
-                    c.status = "failed_resolve"
-                    meta["resolve_error"] = {"kind": "unsupported_source", "message": msg[:300]}
-                    c.source_metadata = meta
-                    db.commit()
-                continue
-            seen, videos, errors = set(), [], []
-            for fid in roots:
-                try:
-                    videos.extend(_walk(fid, 0, seen))
-                except Exception as e:
-                    errors.append(str(e))
-                    print(f"campaign={c.id} folder={fid} ERROR {e}")
             new_assets = 0
-            for item in videos:
-                if not _is_video(item):
+            for item in items:
+                sid = item["source_id"]
+                if sid in existing_ids:
                     continue
-                fid = str(item.get("id") or "")
-                name = str(item.get("name") or fid)
-                if not fid or fid in existing_ids:
-                    continue
-                print(f"campaign={c.id} file={fid} name={name}")
+                print(
+                    f"campaign={c.id} + {item['source_provider']} "
+                    f"id={sid} name={item['name']}"
+                )
                 if args.dry_run:
                     new_assets += 1
                     continue
@@ -215,33 +106,34 @@ def main() -> int:
                     db,
                     AssetCreate(
                         campaign_id=c.id,
-                        source_url=_uc(fid),
-                        source_id=fid,
-                        source_provider="gdrive",
+                        source_url=item["source_url"],
+                        source_id=sid,
+                        source_provider=item["source_provider"],
                         asset_type="video",
                         extra_metadata={
-                            "kind": _kind_from_name(name),
-                            "name": name,
-                            "mime_type": item.get("mimeType") or "video/mp4",
-                            "discovered_by": "drive_resolver_tick",
+                            "kind": item["kind"],
+                            "name": item["name"],
+                            "discovered_by": "asset_resolver_tick",
                         },
                     ),
                 )
-                existing_ids.add(fid)
+                existing_ids.add(sid)
                 new_assets += 1
                 created += 1
-                if new_assets >= MAX_FILES:
-                    break
             if new_assets == 0:
+                gog_fail = any(str(e).startswith("gog:") for e in errors)
+                kind = "gog" if gog_fail else (
+                    "unsupported_source" if errors else "no_videos"
+                )
+                print(f"campaign={c.id} new_files=0 errors={errors[:3]} -> failed_resolve/{kind}")
                 if not args.dry_run:
-                    c.status = "failed_resolve" if errors else "blocked_no_assets"
+                    c.status = "failed_resolve"
                     meta["resolve_error"] = {
-                        "kind": "gog" if errors else "empty_drive_folder",
-                        "message": (errors[0] if errors else "Drive folder listed but contained no video files")[:300],
+                        "kind": kind,
+                        "message": "; ".join(errors)[:300] if errors else "no ingestible videos",
                     }
                     c.source_metadata = meta
                     db.commit()
-                print(f"campaign={c.id} new_files=0 status={c.status}")
                 continue
             if not args.dry_run:
                 c.status = "assets_resolved"
@@ -250,11 +142,11 @@ def main() -> int:
                 db.commit()
                 resolved += 1
             print(f"campaign={c.id} new_files={new_assets} -> assets_resolved")
-        print(f"drive_resolver_tick created={created} resolved={resolved}")
+        print(f"asset_resolver_tick created={created} resolved={resolved}")
         return 0
     except Exception as e:
         db.rollback()
-        print(f"drive_resolver_tick ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+        print(f"asset_resolver_tick ERROR: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
     finally:
         db.close()

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Paso 3a — brief-reader. One Grok JSON call per discovered campaign.
+"""Paso 3a — brief-reader. One Grok JSON call per campaign.
 
-Reads source_metadata.discovered. Fetches public Google Docs linked as
-reference materials. Does not scrape Whop HTML. Does not download videos.
+Reads source_metadata.discovered. Fetches public Google Docs.
+Success always status=briefed (rules + score_preview written).
+Blocking/scoring is 3c; 3b no-ops if there is no Drive folder.
 
-    python scripts/brief_reader_tick.py --dry-run
     python scripts/brief_reader_tick.py --limit 1
+    python scripts/brief_reader_tick.py --campaign-id 8
 """
 from __future__ import annotations
 
@@ -24,7 +25,8 @@ try:
 except Exception:
     pass
 
-PROMPT = """Extract clip-campaign rules from discovery JSON plus any fetched brief documents.
+PROMPT = """Extract clip-campaign rules from discovery JSON plus fetched brief documents.
+The documents are the source of truth when present.
 Return JSON with keys:
   duration_min (number seconds),
   duration_max (number seconds or null),
@@ -32,14 +34,18 @@ Return JSON with keys:
   platforms (array),
   language (string or null),
   captions_required (boolean),
+  caption_must_include (string or null; exact required caption phrase),
   watermark_required (boolean),
-  on_screen_text_required (boolean),
-  tagging_required (boolean),
-  extra_music_forbidden (boolean),
-  heavy_source_files (boolean, true if sources are multi-GB / MediaSilo / hard hosts),
-  content_source_urls (array of urls where footage lives),
   logo_urls (array),
-  extra_rules (short string),
+  on_screen_text_required (boolean),
+  on_screen_text_must_include (array of required phrases),
+  tagging_required (boolean),
+  tags_required (array, e.g. ["@callofduty"]),
+  extra_music_forbidden (boolean),
+  ftc_disclosure_required (boolean),
+  heavy_source_files (boolean),
+  content_source_urls (array of urls where footage lives),
+  extra_rules (string; bullet list of requirements),
   difficulty_notes (short string)
 If a duration minimum is stated (e.g. at least 10 seconds) use it for duration_min.
 Default duration_min=15 duration_max=45 only when the brief is silent on length.
@@ -56,6 +62,7 @@ def _truthy(rules: dict, key: str, fallback: bool) -> bool:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--limit", type=int, default=1)
+    p.add_argument("--campaign-id", type=int, default=None)
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -73,13 +80,16 @@ def main() -> int:
 
     db = SessionLocal()
     try:
-        rows = (
-            db.query(Campaign)
-            .filter(Campaign.status == "discovered")
-            .order_by(Campaign.id.asc())
-            .limit(args.limit)
-            .all()
-        )
+        q = db.query(Campaign)
+        if args.campaign_id:
+            rows = q.filter(Campaign.id == args.campaign_id).all()
+        else:
+            rows = (
+                q.filter(Campaign.status == "discovered")
+                .order_by(Campaign.id.asc())
+                .limit(args.limit)
+                .all()
+            )
         print(f"brief_reader_tick scanned={len(rows)} dry_run={args.dry_run}")
         for c in rows:
             meta = dict(c.source_metadata or {})
@@ -105,7 +115,13 @@ def main() -> int:
                 if classify_url(url) != "google_doc":
                     continue
                 text, err = fetch_google_doc_text(url)
-                fetched_docs.append({"url": url, "ok": text is not None, "error": err, "chars": len(text or "")})
+                fetched_docs.append({
+                    "url": url,
+                    "ok": text is not None,
+                    "error": err,
+                    "chars": len(text or ""),
+                })
+                print(f"campaign={c.id} google_doc ok={text is not None} err={err} chars={len(text or '')}")
                 if text:
                     brief_text_parts.append(text[:12000])
                     all_urls.extend(extract_urls(text))
@@ -122,9 +138,7 @@ def main() -> int:
                 "heuristic_flags": heur,
                 "brief_documents": brief_text_parts,
             }
-            print(
-                f"campaign={c.id} docs={len(brief_text_parts)} urls={len(all_urls)} kinds={kinds}"
-            )
+            print(f"campaign={c.id} docs={len(brief_text_parts)} urls={len(all_urls)} kinds={kinds}")
             if args.dry_run:
                 continue
             try:
@@ -179,7 +193,8 @@ def main() -> int:
             extra["brief_rules"] = rules
             spec["extra"] = extra
             c.spec = spec
-            c.source_instructions = (rules.get("extra_rules") or "")[:4000]
+            notes = rules.get("extra_rules") or rules.get("difficulty_notes") or ""
+            c.source_instructions = str(notes)[:4000]
 
             preview = score_campaign(
                 real_assets=0 if unsupported else 1,
@@ -194,22 +209,17 @@ def main() -> int:
             meta["brief_docs"] = fetched_docs
             meta["score_preview"] = preview
             meta["briefing_error"] = None
-            meta["resolve_error"] = None
             c.source_metadata = meta
-
-            if unsupported or not preview["eligible"]:
-                c.status = "blocked_no_assets"
-                print(
-                    f"campaign={c.id} -> blocked_no_assets "
-                    f"score_preview={preview['value']} pen={preview['penalties']}"
-                )
-            else:
-                c.status = "briefed"
-                print(
-                    f"campaign={c.id} -> briefed duration={spec['duration_min']}-{spec['duration_max']} "
-                    f"score_preview={preview['value']}"
-                )
+            c.status = "briefed"
             db.commit()
+            print(
+                f"campaign={c.id} -> briefed "
+                f"duration={spec['duration_min']}-{spec['duration_max']} "
+                f"wm={rules.get('watermark_required')} cap={rules.get('captions_required')} "
+                f"ost={rules.get('on_screen_text_required')} tag={rules.get('tagging_required')} "
+                f"kinds={rules.get('content_source_kinds')} "
+                f"score_preview={preview['value']} pen={preview['penalties']}"
+            )
         return 0
     except Exception as e:
         db.rollback()

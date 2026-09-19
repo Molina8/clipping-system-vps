@@ -1,17 +1,4 @@
-"""State transition extensions for job_service.
-
-Per architecture_flow.md:
-  Step 9:  on download job completed -> asset.status = 'downloaded',
-           auto-create transcribe job
-  Step 11: on transcribe job completed -> asset.status = 'transcribed'
-  Step 15: (manual) RENDER jobs for approved candidates
-  Step 17: on render job completed -> create Clip record,
-           auto-create QA job
-  Step 19: on QA job completed -> update Clip qa_status and qa_at
-
-These functions are invoked from the /worker/jobs/{id}/result and
-/worker/jobs/{id}/fail endpoints in api/jobs.py (added separately).
-"""
+"""State transition extensions for job_service."""
 from __future__ import annotations
 
 import logging
@@ -34,7 +21,6 @@ def _now() -> datetime:
 
 
 def _update_asset_status(db: Session, asset: Asset, new_status: str) -> None:
-    """Update asset.status and corresponding timestamp."""
     if new_status not in (
         AssetStatus.PENDING.value,
         AssetStatus.DOWNLOADED.value,
@@ -55,7 +41,6 @@ def _update_asset_status(db: Session, asset: Asset, new_status: str) -> None:
 
 
 def _asset_id_from_payload(payload: dict) -> Optional[str]:
-    """Read asset_id from job payload. Returns None if not present."""
     val = payload.get("asset_id") if isinstance(payload, dict) else None
     if not val:
         val = payload.get("source_asset_id") if isinstance(payload, dict) else None
@@ -65,11 +50,6 @@ def _asset_id_from_payload(payload: dict) -> Optional[str]:
 def on_download_completed(
     db: Session, job: Job, result_data: dict
 ) -> None:
-    """Step 9: download job completed successfully.
-
-    - Mark asset.status = 'downloaded'
-    - Create a 'transcribe' job for the same asset
-    """
     asset_id = _asset_id_from_payload(job.payload or {})
     if not asset_id:
         logger.warning(
@@ -98,8 +78,6 @@ def on_download_completed(
     db.commit()
     db.refresh(asset)
 
-    # Worker HTTP downloads are stored as <job_id>.bin on purpose.
-    # Reject only when there is no signal that the bytes are media.
     from app.services.download_payload_validation import (
         validate_download_result, MediaFormatInvalid,
     )
@@ -153,7 +131,7 @@ def on_download_completed(
 def on_transcribe_completed(
     db: Session, job: Job, result_data: dict
 ) -> None:
-    """Step 11: transcribe job completed successfully."""
+    """Store transcript only. Clip selection is a separate explicit step."""
     asset_id = _asset_id_from_payload(job.payload or {})
     if not asset_id:
         logger.warning(
@@ -174,21 +152,12 @@ def on_transcribe_completed(
     asset.extra_metadata = meta
     db.commit()
     db.refresh(asset)
-    logger.info("transcription stored for asset %s", asset.id)
-
-    try:
-        from app.clip_selection.agent import ClipSelectionAgent
-        agent = ClipSelectionAgent()
-        result = agent.run(db, asset_id=str(asset.id))
-        logger.info("clip_selection auto-run asset %s: %s", asset.id, result)
-    except Exception as e:  # noqa: BLE001
-        logger.exception("clip_selection auto-run failed asset %s: %s", asset.id, e)
+    logger.info("transcription stored for asset %s (no auto clip_selection)", asset.id)
 
 
 def on_render_completed(
     db: Session, job: Job, result_data: dict
 ) -> tuple[Optional[Clip], Optional[Job]]:
-    """Step 17: render job completed successfully."""
     asset_id = _asset_id_from_payload(job.payload or {})
     if not asset_id:
         logger.warning(
@@ -291,7 +260,6 @@ def on_render_completed(
 def on_qa_completed(
     db: Session, job: Job, result_data: dict
 ) -> Optional[Clip]:
-    """Step 19: QA job completed successfully."""
     clip_id = None
     if isinstance(job.payload, dict):
         clip_id = job.payload.get("clip_id")
@@ -345,10 +313,6 @@ def on_qa_completed(
             if isinstance(result_data, dict):
                 final_path = result_data.get("final_path_worker")
             set_clip_location(db, clip.id, "pending_upload", final_path_worker=final_path)
-            logger.info(
-                "clip %s step18: moved to pending_upload (final_path=%s)",
-                clip.id, final_path,
-            )
         except Exception as e:  # noqa: BLE001
             logger.exception(
                 "clip %s step18: failed to set pending_upload location: %s",

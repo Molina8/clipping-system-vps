@@ -3,16 +3,12 @@
 URL shapes:
   https://app.mediasilo.com/review/<reviewId>
   https://app.mediasilo.com/review/<reviewId>/f/<folderOrAssetId>
-
-Uses the same unauthenticated JSON the SPA calls. Datacenter IPs often
-get empty 404; run on the VPS / residential path.
 """
 from __future__ import annotations
 
 import json
 import re
 import urllib.error
-import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -62,7 +58,7 @@ def _as_list(payload: Any) -> list[dict]:
     if isinstance(payload, list):
         return [x for x in payload if isinstance(x, dict)]
     if isinstance(payload, dict):
-        for k in ("data", "assets", "items", "results"):
+        for k in ("data", "assets", "items", "results", "folders"):
             val = payload.get(k)
             if isinstance(val, list):
                 return [x for x in val if isinstance(x, dict)]
@@ -92,22 +88,7 @@ def _size(item: dict) -> int | None:
     return None
 
 
-def list_review(review_id: str, folder_id: str | None = None) -> list[dict]:
-    referer = f"https://app.mediasilo.com/review/{review_id}"
-    if folder_id:
-        referer += f"/f/{folder_id}"
-    _get(f"/quicklinks/{review_id}", referer)
-    if folder_id:
-        path = (
-            f"/quicklinks/{review_id}/folders/{folder_id}/assets"
-            f"?_page=1&_pageSize=50&_sortBy=_default&_sort=asc"
-        )
-    else:
-        path = (
-            f"/quicklinks/{review_id}/assets"
-            f"?_page=1&_pageSize=50&_sortBy=_default&_sort=asc"
-        )
-    items = _as_list(_get(path, referer))
+def _map_videos(review_id: str, items: list[dict]) -> list[dict]:
     out = []
     for item in items:
         if not _is_video(item):
@@ -125,4 +106,40 @@ def list_review(review_id: str, folder_id: str | None = None) -> list[dict]:
                 "raw_type": item.get("type") or item.get("assetType"),
             }
         )
+    return out
+
+
+def list_review(review_id: str, folder_id: str | None = None) -> list[dict]:
+    referer = f"https://app.mediasilo.com/review/{review_id}"
+    if folder_id:
+        referer += f"/f/{folder_id}"
+    _get(f"/quicklinks/{review_id}", referer)
+    folder_ids = [folder_id] if folder_id else [None]
+    if not folder_id:
+        folders = _as_list(
+            _get(f"/quicklinks/{review_id}/folders?_page=1&_pageSize=100", referer)
+        )
+        folder_ids = [None] + [str(f.get("id")) for f in folders if f.get("id")]
+    out: list[dict] = []
+    seen: set[str] = set()
+    for fid in folder_ids:
+        if fid:
+            path = (
+                f"/quicklinks/{review_id}/folders/{fid}/assets"
+                f"?_page=1&_pageSize=50&_sortBy=_default&_sort=asc"
+            )
+        else:
+            path = (
+                f"/quicklinks/{review_id}/assets"
+                f"?_page=1&_pageSize=50&_sortBy=_default&_sort=asc"
+            )
+        try:
+            items = _as_list(_get(path, referer))
+        except RuntimeError:
+            continue
+        for row in _map_videos(review_id, items):
+            if row["id"] in seen:
+                continue
+            seen.add(row["id"])
+            out.append(row)
     return out

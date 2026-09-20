@@ -43,64 +43,17 @@
         <div class="mc-sidebar-section">
           <span class="mc-sidebar-heading">Plataforma</span>
           <nav class="mc-sidebar-nav" aria-label="Sidebar">
-            <a class="mc-sidebar-link" data-route="overview" href="#/overview">
-              <div class="mc-sidebar-link-row">
-                <svg class="w-4 h-4 mc-sidebar-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"></path></svg>
-                <span>Overview</span>
-              </div>
-            </a>
-            <a class="mc-sidebar-link" data-route="campaigns" href="#/campaigns">
-              <div class="mc-sidebar-link-row">
-                <svg class="w-4 h-4 mc-sidebar-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"></path></svg>
-                <span>Campañas</span>
-              </div>
-              <span class="mc-sidebar-count mc-sidebar-count-active" id="mc-sidebar-camp-count">0</span>
-            </a>
-            <a class="mc-sidebar-link" data-route="jobs" href="#/jobs">
-              <div class="mc-sidebar-link-row">
-                <svg class="w-4 h-4 mc-sidebar-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"></path></svg>
-                <span>Jobs</span>
-              </div>
-            </a>
-            <a class="mc-sidebar-link" data-route="videos" href="#/videos">
-              <div class="mc-sidebar-link-row">
-                <svg class="w-4 h-4 mc-sidebar-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"></path></svg>
-                <span>Videos</span>
-              </div>
-            </a>
-            <a class="mc-sidebar-link" data-route="clips" href="#/clips">
-              <div class="mc-sidebar-link-row">
-                <svg class="w-4 h-4 mc-sidebar-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M7 4v16M17 4v16M3 8h4m10 0h4M3 12h18M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"></path></svg>
-                <span>Clips</span>
-              </div>
-            </a>
-          </nav>
-        </div>
-        <div class="mc-sidebar-section">
-          <span class="mc-sidebar-heading">Sistema</span>
-          <nav class="mc-sidebar-nav" aria-label="System Links">
-            <a class="mc-sidebar-link" href="/openapi.json" target="_blank">
-              <div class="mc-sidebar-link-row">
-                <svg class="w-4 h-4 mc-sidebar-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"></path></svg>
-                <span>OpenAPI</span>
-              </div>
-            </a>
-            <a class="mc-sidebar-link" href="/health" target="_blank">
-              <div class="mc-sidebar-link-row">
-                <svg class="w-4 h-4 mc-sidebar-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"></path></svg>
-                <span>/health</span>
-              </div>
-              <span class="mc-sidebar-dot" title="health check"></span>
-            </a>
+            <a class="mc-sidebar-link" data-route="overview" href="#/overview">Overview</a>
+            <a class="mc-sidebar-link" data-route="campaigns" href="#/campaigns">Campañas</a>
+            <a class="mc-sidebar-link" data-route="jobs" href="#/jobs">Jobs</a>
+            <a class="mc-sidebar-link" data-route="videos" href="#/videos">Videos</a>
+            <a class="mc-sidebar-link" data-route="clips" href="#/clips">Clips</a>
           </nav>
         </div>
       </div>
       <div class="mc-sidebar-footer">
         <div class="mc-sidebar-foot-row">
-          <span class="mc-sidebar-foot-left">
-            <span class="mc-sidebar-foot-dot"></span>
-            Auto-refresh: <span id="auto-refresh-status">off</span>
-          </span>
+          <span class="mc-sidebar-foot-left">Auto-refresh: <span id="auto-refresh-status">off</span></span>
           <span class="mc-sidebar-foot-right">v2.5-ui</span>
         </div>
       </div>
@@ -122,5 +75,6 @@
 </footer>
 <script src="app.js"></script>
 <script src="mc-v25.js"></script>
+<script src="mc-clips-loc.js"></script>
 </body>
 </html>

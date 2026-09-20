@@ -5,12 +5,19 @@ import logging
 import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.auth import require_bearer
 from app.db.database import get_db
-from app.schemas.clip import ClipCreate, ClipOut, ClipUpdate
+from app.schemas.clip import (
+    ApprovePublishIn,
+    ApprovePublishOut,
+    ClipCreate,
+    ClipOut,
+    ClipPublicationOut,
+    ClipUpdate,
+)
 from app.services.clip_service import (
     create_clip,
     get_clip,
@@ -22,6 +29,11 @@ from app.services.clip_storage_service import (
     list_clips_by_campaign,
     mark_clip_uploaded,
     set_clip_location,
+)
+from app.services.publish_gate import (
+    PublishGateError,
+    approve_clip_publish,
+    list_publications_for_clip,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,37 +78,6 @@ def list_all(
     )
 
 
-@router.get("/{clip_id}", response_model=ClipOut)
-def get_one(
-    clip_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    _: bool = Depends(require_bearer),
-):
-    c = get_clip(db, clip_id)
-    if c is None:
-        raise HTTPException(status_code=404, detail="Clip not found")
-    return c
-
-
-@router.patch("/{clip_id}", response_model=ClipOut)
-def update(
-    clip_id: uuid.UUID,
-    payload: ClipUpdate,
-    db: Session = Depends(get_db),
-    _: bool = Depends(require_bearer),
-):
-    try:
-        c = update_clip(db, clip_id, payload)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    if c is None:
-        raise HTTPException(status_code=404, detail="Clip not found")
-    return c
-
-
-# ── Step 18: per-campaign clip storage (Worker organizes by campaign) ──
-
-
 @router.get("/by_campaign/{campaign_id}/storage", response_model=List[ClipOut])
 def list_by_campaign_storage(
     campaign_id: int,
@@ -128,6 +109,74 @@ def list_by_campaign_storage(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/{clip_id}", response_model=ClipOut)
+def get_one(
+    clip_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_bearer),
+):
+    c = get_clip(db, clip_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    return c
+
+
+@router.patch("/{clip_id}", response_model=ClipOut)
+def update(
+    clip_id: uuid.UUID,
+    payload: ClipUpdate,
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_bearer),
+):
+    try:
+        c = update_clip(db, clip_id, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if c is None:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    return c
+
+
+@router.post("/{clip_id}/approve_publish", response_model=ApprovePublishOut)
+def approve_publish(
+    clip_id: uuid.UUID,
+    payload: ApprovePublishIn = Body(default_factory=ApprovePublishIn),
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_bearer),
+):
+    """Human gate: allow this clip to be picked by publish_enqueue_tick.
+
+    Requires qa=pass, status=approved, location=pending_upload.
+    Default platform is youtube (milestone 1). Does not enqueue a job.
+    Idempotent.
+    """
+    try:
+        clip, pubs, already = approve_clip_publish(
+            db, clip_id, platforms=payload.platforms
+        )
+    except PublishGateError as e:
+        msg = str(e)
+        code = 404 if "not found" in msg.lower() else 400
+        raise HTTPException(status_code=code, detail=msg) from e
+    return ApprovePublishOut(
+        clip=clip,
+        already_approved=already,
+        publications=pubs,
+    )
+
+
+@router.get("/{clip_id}/publications", response_model=List[ClipPublicationOut])
+def list_publications(
+    clip_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_bearer),
+):
+    clip = get_clip(db, clip_id)
+    if clip is None:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    return list_publications_for_clip(db, clip_id)
 
 
 @router.post("/{clip_id}/mark_uploaded", response_model=ClipOut)

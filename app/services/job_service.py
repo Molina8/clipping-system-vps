@@ -39,7 +39,6 @@ class WorkerMismatch(Exception):
 
 
 def _backoff_seconds(attempts: int) -> int:
-    """Simple exponential backoff: 30, 60, 120, 240 ..."""
     return 30 * (2 ** max(0, attempts - 1))
 
 
@@ -67,7 +66,6 @@ def create_job(
     db.add(job)
     db.commit()
     db.refresh(job)
-
     return job
 
 
@@ -96,7 +94,6 @@ def list_jobs(
 
 
 def _recover_expired_leases(db: Session, now: datetime) -> int:
-    """Reset jobs whose lease expired back to pending. Returns count."""
     stmt = (
         update(Job)
         .where(
@@ -117,9 +114,7 @@ def _recover_expired_leases(db: Session, now: datetime) -> int:
 def claim_next_job(db: Session, *, worker_id: str) -> Optional[Job]:
     now = datetime.now(timezone.utc)
     lease_expires = now + timedelta(seconds=LEASE_DURATION_SECONDS)
-
     _recover_expired_leases(db, now)
-
     claim_q = (
         select(Job)
         .where(
@@ -134,7 +129,6 @@ def claim_next_job(db: Session, *, worker_id: str) -> Optional[Job]:
     if job is None:
         db.commit()
         return None
-
     job.status = JobStatus.ASSIGNED.value
     job.worker_id = worker_id
     job.started_at = now
@@ -173,15 +167,14 @@ def complete_job(db: Session, job_id: UUID, *, worker_id: str, result: dict) -> 
     job.lease_until = None
     db.commit()
     db.refresh(job)
-
     try:
         from app.services.job_state_transitions import (
             on_download_completed,
-            on_publish_completed,
             on_qa_completed,
             on_render_completed,
             on_transcribe_completed,
         )
+        from app.services.publish_hooks import on_publish_completed
         handlers = {
             "download": on_download_completed,
             "transcribe": on_transcribe_completed,
@@ -207,10 +200,8 @@ def fail_job(db: Session, job_id: UUID, *, worker_id: str, error_message: str) -
     _ensure_transition(JobStatus(job.status), JobStatus.FAILED)
     if job.worker_id != worker_id:
         raise WorkerMismatch()
-
     now = datetime.now(timezone.utc)
     job.attempts = job.attempts + 1
-
     if job.attempts < job.max_attempts:
         job.status = JobStatus.PENDING.value
         job.error_message = error_message
@@ -221,10 +212,8 @@ def fail_job(db: Session, job_id: UUID, *, worker_id: str, error_message: str) -
         job.status = JobStatus.FAILED.value
         job.error_message = error_message
         job.lease_until = None
-
     db.commit()
     db.refresh(job)
-
     if job.status == JobStatus.FAILED.value:
         try:
             from app.services.job_state_transitions import on_job_failed

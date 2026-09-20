@@ -15,6 +15,24 @@ function locPill(loc) {
   if (!loc) return `<span class="mc-muted">sin location</span>`;
   return statusPill(loc);
 }
+async function hydrateClipLocations(items) {
+  try {
+    const canon = await api("/clips?limit=200");
+    const list = Array.isArray(canon) ? canon : (canon.items || []);
+    const byId = {};
+    list.forEach((x) => { byId[x.id] = x; });
+    (items || []).forEach((c) => {
+      const e = byId[c.id];
+      if (!e) return;
+      if (e.location) c.location = e.location;
+      if (e.final_path_worker) c.final_path_worker = e.final_path_worker;
+      if (e.published_at) c.published_at = e.published_at;
+      if (e.publish_approved_at) c.publish_approved_at = e.publish_approved_at;
+    });
+  } catch (err) {
+    console.warn("hydrateClipLocations", err);
+  }
+}
 async function renderClips(main) {
   stopPolling();
   const qaFilter = sessionStorage.getItem("mc_clips_qa") || "";
@@ -22,6 +40,7 @@ async function renderClips(main) {
   const data = await api("/mission-control/clips" + qs);
   window.WORKER_FILE_BASE_URL = data.worker_file_base_url || "";
   const items = data.items || [];
+  await hydrateClipLocations(items);
   const locOf = (c) => clipLocation(c);
   const nPending = items.filter((c) => locOf(c) === "pending_upload").length;
   const nUploaded = items.filter((c) => locOf(c) === "uploaded").length;
@@ -106,6 +125,7 @@ function renderClipModal(c, baseUrl) {
 }
 function renderClipsTable(rows) {
   if (!rows.length) return `<div class="mc-empty">No clips.</div>`;
+  hydrateClipLocations(rows);
   let html = `<div class="mc-jobs-table-section"><div class="mc-jobs-table-head"><div><span class="mc-jobs-table-title">Clips</span><span class="mc-jobs-table-title-pill">${rows.length}</span></div></div><div style="overflow-x:auto;"><table class="mc-jobs-table"><thead><tr><th>ID</th><th>Location</th><th>Status / QA</th><th>Path</th><th class="num">Duration</th><th>Created</th></tr></thead><tbody>`;
   for (const cl of rows) {
     const loc = clipLocation(cl);

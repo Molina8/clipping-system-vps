@@ -92,7 +92,7 @@ class Clip(Base):
     file_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     file_size: Mapped[int | None] = mapped_column(
-        sa_column_int := None,  # avoid lint - replaced below
+        Integer,
         nullable=True,
     )
 
@@ -141,6 +141,10 @@ class Clip(Base):
         DateTime(timezone=True), nullable=True
     )
     published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Human gate before publish enqueue (milestone 1). None = not approved.
+    publish_approved_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 

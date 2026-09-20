@@ -83,6 +83,8 @@ from app.api.clip_selection import router as clip_selection_router  # noqa: E402
 app.include_router(clip_selection_router)
 from app.api.discovery import router as discovery_router  # noqa: E402
 app.include_router(discovery_router)
+from app.api.social_accounts import router as social_accounts_router  # noqa: E402
+app.include_router(social_accounts_router)
 
 # Optional read-only dashboard. Disabled by default (404 from the gate inside
 # each endpoint). The router is ALWAYS mounted so tests can flip the flag
@@ -108,3 +110,4 @@ else:
 from app.models import candidate, clip  # noqa: E402,F401  # alembic model registration
 from app.models import asset  # noqa: E402,F401  # model registration for alembic
 from app.models import campaign  # noqa: E402,F401  # model registration for alembic
+from app.models import social_account, clip_publication  # noqa: E402,F401

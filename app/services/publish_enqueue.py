@@ -34,8 +34,8 @@ def _caption_for(campaign: Optional[Campaign], clip: Clip) -> str:
     return name.strip()[:100]
 
 
-def _has_open_or_any_publish_job(db: Session, clip_id: uuid.UUID, platform: str) -> bool:
-    """Same policy as download_enqueue: any existing publish job blocks requeue."""
+def _blocks_requeue(db: Session, clip_id: uuid.UUID, platform: str) -> bool:
+    """Block if an open job exists, a live completed job exists, or a dry-run already moved."""
     rows = (
         db.query(Job)
         .filter(Job.job_type == "publish")
@@ -43,7 +43,18 @@ def _has_open_or_any_publish_job(db: Session, clip_id: uuid.UUID, platform: str)
         .filter(Job.payload["platform"].astext == platform)
         .all()
     )
-    return len(rows) > 0
+    for job in rows:
+        if job.status in OPEN_JOB_STATUSES:
+            return True
+        if job.status == "failed":
+            return True
+        if job.status == "completed":
+            res = job.result if isinstance(job.result, dict) else {}
+            if res.get("source_moved"):
+                return True
+            if not res.get("dry_run", True):
+                return True
+    return False
 
 
 def enqueue_publish_jobs(
@@ -54,11 +65,6 @@ def enqueue_publish_jobs(
     dry_run: bool = False,
     create_jobs: bool = True,
 ) -> list[dict]:
-    """Pick approved pending_upload clips and enqueue 1 publish job per run.
-
-    create_jobs=False: report candidates only (script --dry-run).
-    payload.dry_run comes from PUBLISH_DRY_RUN (default 1) or --live.
-    """
     payload_dry = _env_dry_run(dry_run)
     account = db.get(SocialAccount, platform)
     if account is None or account.status != "healthy":
@@ -91,7 +97,7 @@ def enqueue_publish_jobs(
             continue
         if clip.qa_status != "pass" or clip.status != "approved":
             continue
-        if _has_open_or_any_publish_job(db, clip.id, platform):
+        if _blocks_requeue(db, clip.id, platform):
             continue
 
         campaign = db.get(Campaign, clip.campaign_id)

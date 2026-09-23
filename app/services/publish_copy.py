@@ -1,12 +1,11 @@
-"""Title/description for social posts. 0 LLM. Uses campaign name + brief flags."""
+"""Title/description for social posts. 0 LLM on the publish path."""
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any
 
-# "[whop] · $0.75/1k · $248k · FR Yomi …"
 _WHOP_PREFIX = re.compile(
-    r"^\s*\[whop\]\s*(?:·|\|)\s*\$[^\u00b7|]+(?:·|\|)\s*\$[^\u00b7|]+(?:·|\|)?\s*",
+    r"^\s*\[whop\]\s*(?:·|\|)\s*\$[^·|]+(?:·|\|)\s*\$[^·|]+(?:·|\|)?\s*",
     re.IGNORECASE,
 )
 
@@ -15,9 +14,7 @@ def _meta(campaign: Any) -> dict:
     if campaign is None:
         return {}
     sm = getattr(campaign, "source_metadata", None) or {}
-    if not isinstance(sm, dict):
-        return {}
-    return sm
+    return sm if isinstance(sm, dict) else {}
 
 
 def clean_campaign_title(raw: str) -> str:
@@ -27,33 +24,49 @@ def clean_campaign_title(raw: str) -> str:
     return text[:100] if text else "clip"
 
 
-def youtube_copy(campaign: Any, clip: Any) -> tuple[str, str, list[str]]:
-    raw_name = (getattr(campaign, "name", None) if campaign is not None else None) or ""
-    title = clean_campaign_title(raw_name)
+def _hashtags(campaign: Any) -> list[str]:
     sm = _meta(campaign)
     discovered = sm.get("discovered") if isinstance(sm.get("discovered"), dict) else {}
     rules = sm.get("rules") if isinstance(sm.get("rules"), dict) else {}
-
-    hashtags: list[str] = []
     extra = rules.get("hashtags") or discovered.get("hashtags") or []
     if isinstance(extra, str):
         extra = extra.split()
+    tags: list[str] = []
     for tag in extra:
         t = str(tag).strip()
         if not t:
             continue
         if not t.startswith("#"):
             t = "#" + t.lstrip("#")
-        if t.lower() not in {h.lower() for h in hashtags}:
-            hashtags.append(t)
-    if "#Shorts" not in hashtags:
-        hashtags.append("#Shorts")
+        if t.lower() not in {h.lower() for h in tags}:
+            tags.append(t)
+    if "#Shorts" not in tags:
+        tags.append("#Shorts")
+    return tags[:8]
 
-    lines = [title]
-    desc_brief = rules.get("caption") or rules.get("description") or discovered.get("description")
-    if isinstance(desc_brief, str) and desc_brief.strip() and desc_brief.strip() != title:
-        lines.append(desc_brief.strip()[:400])
-    if hashtags:
-        lines.append(" ".join(hashtags[:8]))
-    description = "\n\n".join(lines)[:5000]
-    return title, description, hashtags
+
+def youtube_copy(campaign: Any, clip: Any, candidate: Any = None) -> tuple[str, str, list[str]]:
+    camp_title = clean_campaign_title(getattr(campaign, "name", None) or "")
+    cmeta = {}
+    if candidate is not None:
+        raw = getattr(candidate, "extra_metadata", None) or {}
+        if isinstance(raw, dict):
+            cmeta = raw
+    kind = str(cmeta.get("kind") or cmeta.get("source") or "")
+    title = str(cmeta.get("title") or "").strip()[:100] or camp_title
+
+    caption = (
+        str(cmeta.get("caption") or cmeta.get("description") or "").strip()
+        or str(getattr(candidate, "reasoning", None) or "").strip()
+    )
+    if len(caption) < 12 or kind in {"silent", "duration_cut"}:
+        caption = (
+            f"{camp_title}\n\n"
+            "Highlight from the campaign. Watch till the end."
+        )
+    elif caption.lower() in {"grok", "short", "speech"}:
+        caption = f"{camp_title}\n\n{caption}"
+
+    tags = _hashtags(campaign)
+    description = f"{caption}\n\n{' '.join(tags)}"[:5000]
+    return title, description, tags

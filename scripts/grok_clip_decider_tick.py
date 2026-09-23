@@ -17,7 +17,8 @@ except Exception:
 
 PROMPT = """Pick 1 or 2 clip windows from this transcript for short-form video.
 Rules: duration_min={dmin}, duration_max={dmax} seconds. Format 9:16.
-Return JSON: {{"clips":[{{"start":0.0,"end":20.0,"reason":"short"}}]}}
+Return JSON:
+{{"clips":[{{"start":0.0,"end":20.0,"reason":"why this window","title":"max 80 chars hook","caption":"2-3 lines for YouTube description, no prices, no [whop]"}}]}}
 Prefer complete phrases. Do not exceed duration_max. Stay inside video_duration={duration}.
 Transcript segments (start,end,text):
 """
@@ -84,6 +85,8 @@ def main() -> int:
                     continue
                 if end - start > dmax + 1:
                     end = start + dmax
+                title = str(clip.get("title") or "")[:100]
+                caption = str(clip.get("caption") or clip.get("reason") or "")[:800]
                 c = Candidate(
                     campaign_id=asset.campaign_id,
                     asset_id=asset.id,
@@ -91,7 +94,12 @@ def main() -> int:
                     end_time=round(end, 2),
                     score=0.7,
                     reasoning=str(clip.get("reason") or "grok")[:500],
-                    extra_metadata={"source": "grok_clip_decider", "kind": "speech"},
+                    extra_metadata={
+                        "source": "grok_clip_decider",
+                        "kind": "speech",
+                        "title": title,
+                        "caption": caption,
+                    },
                     status="pending",
                 )
                 db.add(c)

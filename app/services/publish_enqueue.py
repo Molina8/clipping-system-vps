@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 OPEN_JOB_STATUSES = ("pending", "assigned", "processing")
 MILESTONE_PLATFORM = "youtube"
+OK_LOCATIONS = ("pending_upload", "uploaded")
 
 
 def _env_dry_run(cli_dry_run: bool) -> bool:
@@ -34,8 +35,7 @@ def _caption_for(campaign: Optional[Campaign], clip: Clip) -> str:
     return name.strip()[:100]
 
 
-def _blocks_requeue(db: Session, clip_id: uuid.UUID, platform: str) -> bool:
-    """Block if an open job exists, a live completed job exists, or a dry-run already moved."""
+def _blocks_requeue(db: Session, clip_id: uuid.UUID, platform: str, *, live: bool) -> bool:
     rows = (
         db.query(Job)
         .filter(Job.job_type == "publish")
@@ -46,13 +46,14 @@ def _blocks_requeue(db: Session, clip_id: uuid.UUID, platform: str) -> bool:
     for job in rows:
         if job.status in OPEN_JOB_STATUSES:
             return True
-        if job.status == "failed":
+        if job.status == "failed" and not live:
             return True
         if job.status == "completed":
             res = job.result if isinstance(job.result, dict) else {}
-            if res.get("source_moved"):
-                return True
-            if not res.get("dry_run", True):
+            was_dry = bool(res.get("dry_run", True))
+            if live and was_dry:
+                continue
+            if res.get("source_moved") or not was_dry:
                 return True
     return False
 
@@ -66,6 +67,7 @@ def enqueue_publish_jobs(
     create_jobs: bool = True,
 ) -> list[dict]:
     payload_dry = _env_dry_run(dry_run)
+    live = not payload_dry
     account = db.get(SocialAccount, platform)
     if account is None or account.status != "healthy":
         logger.warning("publish enqueue skipped: social_accounts.%s missing/unhealthy", platform)
@@ -93,11 +95,11 @@ def enqueue_publish_jobs(
             continue
         if clip.publish_approved_at is None:
             continue
-        if clip.location != "pending_upload":
+        if clip.location not in OK_LOCATIONS:
             continue
         if clip.qa_status != "pass" or clip.status != "approved":
             continue
-        if _blocks_requeue(db, clip.id, platform):
+        if _blocks_requeue(db, clip.id, platform, live=live):
             continue
 
         campaign = db.get(Campaign, clip.campaign_id)

@@ -15,6 +15,7 @@ from app.models.clip_publication import ClipPublication
 from app.models.job import Job
 from app.models.social_account import SocialAccount
 from app.services.job_service import create_job
+from app.services.publish_copy import youtube_copy
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +29,6 @@ def _env_dry_run(cli_dry_run: bool) -> bool:
         return True
     raw = (os.environ.get("PUBLISH_DRY_RUN") or "1").strip().lower()
     return raw not in {"0", "false", "no", "off"}
-
-
-def _caption_for(campaign: Optional[Campaign], clip: Clip) -> str:
-    name = (campaign.name if campaign is not None else "") or f"campaign-{clip.campaign_id}"
-    return name.strip()[:100]
 
 
 def _blocks_requeue(db: Session, clip_id: uuid.UUID, platform: str, *, live: bool) -> bool:
@@ -103,6 +99,7 @@ def enqueue_publish_jobs(
             continue
 
         campaign = db.get(Campaign, clip.campaign_id)
+        title, description, hashtags = youtube_copy(campaign, clip)
         file_path = clip.final_path_worker or clip.file_path
         payload = {
             "clip_id": str(clip.id),
@@ -111,10 +108,10 @@ def enqueue_publish_jobs(
             "platform": platform,
             "file_path": file_path,
             "platforms": [platform],
-            "caption": _caption_for(campaign, clip),
-            "hashtags": [],
+            "caption": description,
+            "hashtags": hashtags,
             "mentions": [],
-            "title": _caption_for(campaign, clip),
+            "title": title,
             "dry_run": payload_dry,
         }
         row = {
@@ -122,6 +119,7 @@ def enqueue_publish_jobs(
             "campaign_id": clip.campaign_id,
             "platform": platform,
             "file_path": file_path,
+            "title": title,
             "dry_run": payload_dry,
         }
         if not create_jobs:
@@ -138,7 +136,7 @@ def enqueue_publish_jobs(
         out.append(row)
         made += 1
         logger.info(
-            "enqueued publish job %s clip=%s platform=%s dry_run=%s",
-            job.id, clip.id, platform, payload_dry,
+            "enqueued publish job %s clip=%s platform=%s dry_run=%s title=%s",
+            job.id, clip.id, platform, payload_dry, title,
         )
     return out

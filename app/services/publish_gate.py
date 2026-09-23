@@ -1,9 +1,4 @@
-"""Human gate before a clip can enter the publish enqueue tick.
-
-Milestone 1 (YouTube): POST /clips/{id}/approve_publish stamps
-`clips.publish_approved_at` and upserts clip_publications rows.
-Does NOT create a publish job. That is step 2 (tick).
-"""
+"""Human gate before a clip can enter the publish enqueue tick."""
 from __future__ import annotations
 
 import logging
@@ -21,6 +16,7 @@ from app.models.social_account import SOCIAL_PLATFORM_VALUES, SocialAccount
 logger = logging.getLogger(__name__)
 
 DEFAULT_PLATFORMS = ("youtube",)
+OK_LOCATIONS = ("pending_upload", "uploaded")
 
 
 def _now() -> datetime:
@@ -49,12 +45,6 @@ def approve_clip_publish(
     clip_id: uuid.UUID,
     platforms: Optional[list[str]] = None,
 ) -> tuple[Clip, list[ClipPublication], bool]:
-    """Mark a QA-passed clip as allowed to publish.
-
-    Returns (clip, publications, already_approved).
-    Idempotent: a second call refreshes platforms and keeps the original
-    publish_approved_at.
-    """
     wanted = list(platforms) if platforms else list(DEFAULT_PLATFORMS)
     wanted = [p.strip().lower() for p in wanted if p and p.strip()]
     if not wanted:
@@ -77,9 +67,9 @@ def approve_clip_publish(
         raise PublishGateError(
             f"clip {clip_id} status={clip.status!r}, need 'approved'"
         )
-    if clip.location != "pending_upload":
+    if clip.location not in OK_LOCATIONS:
         raise PublishGateError(
-            f"clip {clip_id} location={clip.location!r}, need 'pending_upload'"
+            f"clip {clip_id} location={clip.location!r}, need pending_upload|uploaded"
         )
 
     already = clip.publish_approved_at is not None

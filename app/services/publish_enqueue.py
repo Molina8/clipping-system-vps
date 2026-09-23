@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.campaign import Campaign
+from app.models.candidate import Candidate
 from app.models.clip import Clip
 from app.models.clip_publication import ClipPublication
 from app.models.job import Job
@@ -99,7 +100,8 @@ def enqueue_publish_jobs(
             continue
 
         campaign = db.get(Campaign, clip.campaign_id)
-        title, description, hashtags = youtube_copy(campaign, clip)
+        cand = db.get(Candidate, clip.candidate_id) if clip.candidate_id else None
+        title, description, hashtags = youtube_copy(campaign, clip, cand)
         file_path = clip.final_path_worker or clip.file_path
         payload = {
             "clip_id": str(clip.id),
